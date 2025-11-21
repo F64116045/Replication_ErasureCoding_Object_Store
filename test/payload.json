@@ -1,0 +1,15 @@
+{
+  "like_count": 1500,
+  "view_count": 50000,
+  "inventory_count": 100,
+  "update_count": 25,
+  "content": "This is test article content with large text data to trigger hybrid storage logic................................................",
+  "author_id": "user_12345",
+  "description": "Product description",
+  "specifications": {
+    "size": "L",
+    "color": "blue",
+    "material": "cotton"
+  },
+  "create_time": "2025-10-31T12:00:00Z"
+}
