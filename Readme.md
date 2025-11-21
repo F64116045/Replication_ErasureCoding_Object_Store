@@ -155,7 +155,8 @@ For only hybrid strategies
 ```
 python3 test/hybrid_only.py
 ```
-
+![Success1](./img/Success1.png)
+![Success1](./img/Success2.png)
 
 ## Project Structure
 
