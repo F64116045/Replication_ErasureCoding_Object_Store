@@ -1,0 +1,238 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Nginx Load Balancer
+  # Acts as the single entry point for the cluster.
+  # Maps Host:8000 -> Container:80.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+    networks:
+      - storage_net
+
+  # ---------------------------------------------------------------------------
+  # 2. API Gateway Cluster (High Availability)
+  # Scaled to 3 replicas. No external ports (access via Nginx only).
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      replicas: 3
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAMES_CSV=storage_node_1,storage_node_2,storage_node_3,storage_node_4,storage_node_5,storage_node_6
+    depends_on:
+      - etcd0
+      - etcd1
+      - etcd2
+      - storage_node_1
+      - storage_node_2
+      - storage_node_3
+      - storage_node_4
+      - storage_node_5
+      - storage_node_6
+    command: ["/usr/local/bin/api"]
+    networks:
+      - storage_net
+
+  # ---------------------------------------------------------------------------
+  # 3. Etcd Cluster (Consensus & Metadata)
+  # 3-node HA setup for service discovery and metadata storage.
+  # ---------------------------------------------------------------------------
+  etcd0:
+    image: 'bitnamilegacy/etcd:3.5.16'
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_NAME=etcd0
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd0:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd0:2379
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    volumes:
+      - etcd_data_0:/bitnami/etcd
+    networks:
+      - storage_net
+
+  etcd1:
+    image: 'bitnamilegacy/etcd:3.5.16'
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_NAME=etcd1
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd1:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd1:2379
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    volumes:
+      - etcd_data_1:/bitnami/etcd
+    networks:
+      - storage_net
+
+  etcd2:
+    image: 'bitnamilegacy/etcd:3.5.16'
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_NAME=etcd2
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd2:2380
+      - ETCD_ADVERTISE_CLIENT_URLS=http://etcd2:2379
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-cluster-1
+      - ETCD_INITIAL_CLUSTER=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+    volumes:
+      - etcd_data_2:/bitnami/etcd
+    networks:
+      - storage_net
+
+  # ---------------------------------------------------------------------------
+  # 4. Storage Nodes (Data Layer)
+  # 6 instances representing physical storage units.
+  # Note: Ports are not exposed to host; communication is internal via 'storage_net'.
+  # ---------------------------------------------------------------------------
+  storage_node_1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/storage_node"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAME=storage_node_1
+      - NODE_PORT=8001
+      - STORAGE_DIR=/data/node1
+    volumes:
+      - storage_data_1:/data/node1
+    networks:
+      - storage_net
+
+  storage_node_2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/storage_node"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAME=storage_node_2
+      - NODE_PORT=8002
+      - STORAGE_DIR=/data/node2
+    volumes:
+      - storage_data_2:/data/node2
+    networks:
+      - storage_net
+
+  storage_node_3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/storage_node"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAME=storage_node_3
+      - NODE_PORT=8003
+      - STORAGE_DIR=/data/node3
+    volumes:
+      - storage_data_3:/data/node3
+    networks:
+      - storage_net
+
+  storage_node_4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/storage_node"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAME=storage_node_4
+      - NODE_PORT=8004
+      - STORAGE_DIR=/data/node4
+    volumes:
+      - storage_data_4:/data/node4
+    networks:
+      - storage_net
+
+  storage_node_5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/storage_node"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAME=storage_node_5
+      - NODE_PORT=8005
+      - STORAGE_DIR=/data/node5
+    volumes:
+      - storage_data_5:/data/node5
+    networks:
+      - storage_net
+
+  storage_node_6:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["/usr/local/bin/storage_node"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - NODE_NAME=storage_node_6
+      - NODE_PORT=8006
+      - STORAGE_DIR=/data/node6
+    volumes:
+      - storage_data_6:/data/node6
+    networks:
+      - storage_net
+
+  # ---------------------------------------------------------------------------
+  # 5. Healer Service (Background Worker)
+  # 2 replicas for high availability. Handles data reconstruction.
+  # ---------------------------------------------------------------------------
+  healer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    deploy:
+      replicas: 2
+    command: ["/usr/local/bin/healer"]
+    environment:
+      - ETCD_HOST=etcd0
+      - ETCD_PORT=2379
+      - HOSTNAME=healer
+    depends_on:
+      - api
+    networks:
+      - storage_net
+
+# ---------------------------------------------------------------------------
+# Networks & Volumes
+# ---------------------------------------------------------------------------
+networks:
+  storage_net:
+    driver: bridge
+
+volumes:
+  etcd_data_0:
+  etcd_data_1:
+  etcd_data_2:
+  storage_data_1:
+  storage_data_2:
+  storage_data_3:
+  storage_data_4:
+  storage_data_5:
+  storage_data_6:
