@@ -1,4 +1,4 @@
-# Hybrid Distributed Object Store
+# Replication + Erasure Coding Object Store
 
 Fault-tolerant distributed object storage system written in Go. It features a **Field-Level Hybrid Storage** strategy, optimizing costs by automatically splitting object(JSON data) into "Hot" (Replicated) and "Cold" (Erasure Coded) partitions based on access patterns.
 
