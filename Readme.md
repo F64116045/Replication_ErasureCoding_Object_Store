@@ -20,7 +20,7 @@ Fault-tolerant distributed object storage system written in Go. It features a **
 
 The system is composed of microservices deployed via Docker Compose:
 
-```
+```mermaid
 graph TD
     User[Client] -->|HTTP :8000| LB[Nginx Load Balancer]
     LB --> API[API Gateway Cluster x3]
@@ -154,4 +154,30 @@ python3 test/simple_test.py
 For only hybrid strategies 
 ```
 python3 test/hybrid_only.py
+```
+
+
+## Project Structure
+
+```
+.
+├── cmd/                       # Entry points (Main applications)
+│   ├── api/                   # API Gateway
+│   ├── healer/                # Self-healing service
+│   └── storage_node/          # Dumb storage node
+├── internal/                  # Private library code
+│   ├── config/                # Configuration constants
+│   ├── ec/                    # Reed-Solomon wrapper
+│   ├── etcd/                  # Etcd client wrapper
+│   ├── httpclient/            # Connection pooling client
+│   ├── interfaces/            # Interface definitions
+│   ├── monitoringservice/     # Node status logic
+│   ├── readservice/           # Read path logic
+│   ├── storageops/            # Low-level delete operations
+│   ├── utils/                 # JSON and Hybrid logic
+│   └── writeservice/          # Write path logic
+├── docs/                      # Documentation
+├── test/                      # Integration tests
+├── docker-compose.yaml        # Container orchestration
+└── nginx.conf                 # Load balancer config
 ```
