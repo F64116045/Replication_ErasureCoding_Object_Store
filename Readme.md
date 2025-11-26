@@ -111,6 +111,15 @@ curl -X POST "http://localhost:8000/write?key=image.png&strategy=ec" \
 
 ```
 
+**Option C: Replication** 
+Best for small, critical data that requires low latency. Stores full copies on 3 nodes.
+
+```
+curl -X POST "http://localhost:8000/write?key=config:settings&strategy=replication" \
+     -H "Content-Type: application/json" \
+     -d '{"theme": "dark", "notifications": true}'
+```
+
 ### 2. Retrieve Data (Read)
 
 Simply request the key. The system automatically resolves the strategy, retrieves shards/replicas, reconstructs the data, and returns the original JSON.
