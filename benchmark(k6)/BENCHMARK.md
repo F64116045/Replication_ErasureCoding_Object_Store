@@ -40,7 +40,7 @@ This benchmark includes three main modes, corresponding to the system's three wr
 
 ### C. Hybrid Mode (Core Verification)
 
-- **Command**: `k6 run -e MODE=hybrid benchmark.js`
+- **Command**: `k6 run -e MODE=hybrid_hot benchmark.js`
 - **Behavior**: Simulates a **Partial Update**. The payload contains a changing counter (Hot) and an unchanged large description file (Cold).
 - **Verification Goal**: **Pure Hot Update Mechanism**.
 - **Expectation**:
@@ -53,7 +53,7 @@ This benchmark includes three main modes, corresponding to the system's three wr
 This uses 10 concurrent users to repeatedly update objects with 800KB of cold data.
 
 ```
-k6 run -e MODE=hybrid -e SIZE=800kb benchmark.js
+k6 run -e MODE=hybrid_hot -e SIZE=800kb benchmark.js
 ```
 
 **Scenario 2: Compare EC Overhead**
