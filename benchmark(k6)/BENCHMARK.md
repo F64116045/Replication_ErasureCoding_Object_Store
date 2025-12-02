@@ -41,16 +41,15 @@ Stop all containers and remove volumes to clear Etcd and Storage Node data.
     
     ```
     
-2. **Start Core Cluster**
-Start the cluster in detached mode.
+2. **Start Core Cluster (Terminal 1)**
+Start the cluster. **This will occupy the terminal** to stream logs.
     
     ```
     docker-compose up --build
     
     ```
     
-3. **Stop Background Services (Healer)**
-The Healer service competes for Etcd locks and CPU. Stop it to measure pure API performance.
+3. **Stop Background Services (Terminal 2)OPEN A NEW TERMINAL.** The Healer service competes for Etcd locks and CPU. Stop it to measure pure API performance.
     
     ```
     docker-compose stop healer
@@ -67,24 +66,32 @@ This benchmark includes three main modes, corresponding to the system's three wr
 ### A. Replication Mode (Baseline)
 
 - **Reset & Prep:**
+    1. **Terminal 1:** `docker-compose down -v`
+    2. **Terminal 1:** `docker-compose up --build` (Wait for logs to flow)
+    3. **Terminal 2:** `docker-compose stop healer`
+- **Command (Terminal 2)**:
     
-    ```c
-    docker-compose down -v && docker-compose up && docker-compose stop healer
+    ```
+    k6 run -e MODE=replication benchmark.js
+    
     ```
     
-- **Command**: `k6 run -e MODE=replication benchmark.js`
 - **Behavior**: Simulates standard writes for critical data.
 - **Expectation**: Serves as the performance baseline. Latency should be relatively low, primarily limited by network bandwidth.
 
 ### B. Erasure Coding (EC) Mode (Stress Test)
 
 - **Reset & Prep:**
+    1. **Terminal 1:** `docker-compose down -v`
+    2. **Terminal 1:** `docker-compose up --build` (Wait for logs to flow)
+    3. **Terminal 2:** `docker-compose stop healer`
+- **Command (Terminal 2)**:
     
-    ```c
-    docker-compose down -v && docker-compose up && docker-compose stop healer
+    ```
+    k6 run -e MODE=ec benchmark.js
+    
     ```
     
-- **Command**: `k6 run -e MODE=ec benchmark.js`
 - **Behavior**: Forces the system to perform Reed-Solomon (4+2) encoding for every request.
 - **Expectation**:
     - **Latency**: Highest (due to intensive CPU calculations).
@@ -94,25 +101,27 @@ This benchmark includes three main modes, corresponding to the system's three wr
 ### C. Hybrid Mode (Core Verification)
 
 - **Reset & Prep:**
+    1. **Terminal 1:** `docker-compose down -v`
+    2. **Terminal 1:** `docker-compose up --build` (Wait for logs to flow)
+    3. **Terminal 2:** `docker-compose stop healer`
+- **Command (Terminal 2)**:
     
-    ```c
-    docker-compose down -v && docker-compose up && docker-compose stop healer
+    ```
+    k6 run -e MODE=hybrid benchmark.js
+    
     ```
     
-- **Command**: `k6 run -e MODE=hybrid benchmark.js`
 - **Behavior**: Simulates a **Partial Update**. The payload contains a changing counter (Hot) and an unchanged large description file (Cold).
 - **Verification Goal**: **Pure Hot Update Mechanism**.
 - **Expectation**:
     - **Latency**: Should be close to Replication mode and **significantly lower than EC mode**.
-    - **Check**: The `Is Pure Hot` metric in the k6 output must be **100%**.
     - This proves the system successfully detected that the cold data did not change, skipping expensive EC encoding and I/O operations.
 
 ## 5. Result Analysis
 
 After execution, please check the terminal output summary:
 
-    
 **Performance Metric (`http_req_duration`)**:
+
 - **p(95)**: Represents that 95% of requests were completed within this time.
 - If `Hybrid p(95)` << `EC p(95)`, the system design is proven successful.
-
