@@ -8,6 +8,7 @@ The primary purpose of this test script is to verify the performance of the **Mu
 
 - **k6**: Please refer to the [k6 Installation Guide](https://k6.io/docs/get-started/installation/) to install the tool.
 - **System Environment**: Ensure the Docker Cluster is running and the API Gateway is accessible via `http://localhost:8000`.
+- **Docker & Docker Compose**: Installed on the host machine.
 
 ## 2. Configuration
 
@@ -19,18 +20,70 @@ The test script supports adjusting behavior via environment variables (`-e`):
 | **`MODE`** | `replication` | `replication`, `ec`, `hybrid` | **Key Parameter**. Determines the write strategy for the test (see below). |
 | `SIZE` | `800kb` | `10kb`, `100kb`, `800kb` | Simulates the size of the Cold Data. |
 
-## 3. Scenarios and Expected Results
+## 3. Controlled Environment Setup (Crucial)
+
+To obtain accurate benchmarks, you must eliminate background noise and accumulated state.
+
+### Why Reset?
+
+- **Data accumulation**: Previous tests fill up storage and Etcd keys, potentially slowing down subsequent I/O.
+- **Background Noise**: The `healer` service consumes CPU and locks while checking for inconsistencies. This interferes with pure write/read performance measurements.
+
+### The Standard Testing Workflow
+
+For **EACH** benchmark run (e.g., before switching from EC to Hybrid), follow this exact sequence:
+
+1. **Full Reset (Wipe Data)**
+Stop all containers and remove volumes to clear Etcd and Storage Node data.
+    
+    ```
+    docker-compose down -v
+    
+    ```
+    
+2. **Start Core Cluster**
+Start the cluster in detached mode.
+    
+    ```
+    docker-compose up --build
+    
+    ```
+    
+3. **Stop Background Services (Healer)**
+The Healer service competes for Etcd locks and CPU. Stop it to measure pure API performance.
+    
+    ```
+    docker-compose stop healer
+    
+    ```
+    
+4. **Warm-up / Wait**
+Wait ~10-15 seconds for Etcd leader election and API Gateway initialization.
+
+## 4. Scenarios and Expected Results
 
 This benchmark includes three main modes, corresponding to the system's three write paths:
 
 ### A. Replication Mode (Baseline)
 
+- **Reset & Prep:**
+    
+    ```c
+    docker-compose down -v && docker-compose up && docker-compose stop healer
+    ```
+    
 - **Command**: `k6 run -e MODE=replication benchmark.js`
 - **Behavior**: Simulates standard writes for critical data.
 - **Expectation**: Serves as the performance baseline. Latency should be relatively low, primarily limited by network bandwidth.
 
 ### B. Erasure Coding (EC) Mode (Stress Test)
 
+- **Reset & Prep:**
+    
+    ```c
+    docker-compose down -v && docker-compose up && docker-compose stop healer
+    ```
+    
 - **Command**: `k6 run -e MODE=ec benchmark.js`
 - **Behavior**: Forces the system to perform Reed-Solomon (4+2) encoding for every request.
 - **Expectation**:
@@ -40,28 +93,19 @@ This benchmark includes three main modes, corresponding to the system's three wr
 
 ### C. Hybrid Mode (Core Verification)
 
-- **Command**: `k6 run -e MODE=hybrid_hot benchmark.js`
+- **Reset & Prep:**
+    
+    ```c
+    docker-compose down -v && docker-compose up && docker-compose stop healer
+    ```
+    
+- **Command**: `k6 run -e MODE=hybrid benchmark.js`
 - **Behavior**: Simulates a **Partial Update**. The payload contains a changing counter (Hot) and an unchanged large description file (Cold).
 - **Verification Goal**: **Pure Hot Update Mechanism**.
 - **Expectation**:
     - **Latency**: Should be close to Replication mode and **significantly lower than EC mode**.
+    - **Check**: The `Is Pure Hot` metric in the k6 output must be **100%**.
     - This proves the system successfully detected that the cold data did not change, skipping expensive EC encoding and I/O operations.
-
-## 4. Quick Start Examples
-
-**Scenario 1: Verify Hybrid Optimization**
-This uses 10 concurrent users to repeatedly update objects with 800KB of cold data.
-
-```
-k6 run -e MODE=hybrid_hot -e SIZE=800kb benchmark.js
-```
-
-**Scenario 2: Compare EC Overhead**
-Run this command and record the Latency to compare with Scenario 1.
-
-```
-k6 run -e MODE=ec -e SIZE=800kb benchmarkt.js
-```
 
 ## 5. Result Analysis
 
