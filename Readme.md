@@ -4,6 +4,7 @@ Fault-tolerant distributed object storage system written in Go. It features a no
 
 This system addresses the write amplification problem inherent in traditional object storage systems when handling large, structured data with frequent metadata updates.
 
+
 ## **Features**
 
 - **Multi-Strategy Storage**
@@ -12,17 +13,21 @@ This system addresses the write amplification problem inherent in traditional ob
     - **Field Hybrid**: Automatically separates frequently accessed fields (Hot) from bulk data (Cold).
         - **Automatic Tiering**: Automatically splits a JSON object into Hot Data (Replicated) and Cold Data (Erasure Coded RS 4+2).
         - **Pure Hot Update**: Calculates SHA-256 hashes to detect if cold data remains unchanged. If matched, it skips expensive EC encoding and backend I/O.
+
 - **Self-Healing System**
     - **Leader Election**: Background `Healer` nodes compete for leadership to prevent race conditions.
     - **Auto-Repair**: Automatically reconstructs missing EC shards or copies missing replicas.
     - **Zombie Cleanup**: Rolls back stalled pending transactions automatically.
+
 - **Log-Centric Architecture**
     - **Redpanda as WAL**: Decouples the Write-Ahead Log from metadata storage. It utilizes sequential disk I/O to provide high-throughput durability guarantees.
     - **Etcd for Metadata**: Ensures strong consistency for object location maps, hashes, and configuration, acting as the single source of truth for system state.
     - **Stateless API Gateway**: The API layer is purely computational, allowing for horizontal scaling without complex state coordination.
+
 - **Async I/O Storage Engine**
     - **Non-blocking Write-Back**: Storage nodes utilize an in-memory `WriteQueue` and background I/O workers to handle disk operations.
     - **Latency Optimization**: Disk write latency is decoupled from the API response time, reducing storage node response latency from milliseconds to microseconds.
+
 
 ## Architecture
 
@@ -34,7 +39,7 @@ graph TD
     LB --> API[API Gateway Cluster x3]
 
     subgraph Control Plane
-        API -->|WAL Append | RP[Redpanda / Kafka]
+        API -->|WAL Append | RP[Redpanda]
         API -->|Metadata Commit | Etcd[Etcd Cluster x3]
     end
 
