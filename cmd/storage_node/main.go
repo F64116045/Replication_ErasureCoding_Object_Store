@@ -62,11 +62,9 @@ func newStorageEngine(port, nodeName, storageDir string) *storageEngine {
 }
 
 // startIoWorker consumes write tasks from the queue and performs blocking disk I/O.
-// This decouples the API response time from the disk write latency.
 func (s *storageEngine) startIoWorker() {
 	log.Println("[Async IO] Worker started. Waiting for tasks...")
 	for task := range s.writeQueue {
-		// Validate path again before writing
 		filePath, err := s._getSafePath(task.Key)
 		if err != nil {
 			log.Printf("[Async IO] Error resolving path for key %s: %v", task.Key, err)
@@ -76,8 +74,6 @@ func (s *storageEngine) startIoWorker() {
 		// Perform the actual blocking disk write operation.
 		if err := os.WriteFile(filePath, task.Data, 0644); err != nil {
 			log.Printf("[Async IO] Disk Write Failed for %s: %v", filePath, err)
-			// Note: In a production system, failed async writes should trigger alerts or retries.
-			// Here, we rely on the Healer service to eventually fix data inconsistencies based on WAL.
 		}
 
 		// Update metrics
@@ -87,7 +83,7 @@ func (s *storageEngine) startIoWorker() {
 	}
 }
 
-// _getSafePath prevents directory traversal attacks by cleaning and validating the path.
+// _getSafePath prevents directory traversal attacks.
 func (s *storageEngine) _getSafePath(key string) (string, error) {
 	safeKey := filepath.Clean(key)
 	if strings.Contains(safeKey, "..") || strings.HasPrefix(safeKey, "/") {
@@ -97,9 +93,7 @@ func (s *storageEngine) _getSafePath(key string) (string, error) {
 }
 
 // store queues the write task for asynchronous processing.
-// It returns immediately once the task is enqueued (Write-Back strategy).
 func (s *storageEngine) store(key string, data []byte) (int, error) {
-	// Fail fast if path is invalid
 	_, err := s._getSafePath(key)
 	if err != nil {
 		return 0, err
@@ -113,17 +107,14 @@ func (s *storageEngine) store(key string, data []byte) (int, error) {
 	// Non-blocking enqueue
 	select {
 	case s.writeQueue <- task:
-		// Successfully buffered in memory. Return success immediately.
 		return len(data), nil
 	default:
-		// Apply backpressure if the queue is full to prevent OOM.
 		log.Printf("[Async IO] Queue Full! Dropping request for key: %s", key)
 		return 0, fmt.Errorf("storage node overloaded (queue full)")
 	}
 }
 
 // retrieve reads data from disk synchronously.
-// Reads must remain blocking to ensure data availability for the client.
 func (s *storageEngine) retrieve(key string) ([]byte, error) {
 	filePath, err := s._getSafePath(key)
 	if err != nil {
@@ -133,7 +124,7 @@ func (s *storageEngine) retrieve(key string) ([]byte, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // Return nil if not found
+			return nil, nil
 		}
 		log.Printf("Error reading file %s: %v", filePath, err)
 		return nil, err
@@ -151,7 +142,7 @@ func (s *storageEngine) delete(key string) (bool, error) {
 	err = os.Remove(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil // File didn't exist, return false
+			return false, nil
 		}
 		log.Printf("Error deleting file %s: %v", filePath, err)
 		return false, err
@@ -159,7 +150,7 @@ func (s *storageEngine) delete(key string) (bool, error) {
 	return true, nil
 }
 
-// getInfo returns current statistics and health status of the storage engine.
+// getInfo returns current statistics.
 func (s *storageEngine) getInfo() (map[string]interface{}, error) {
 	s.lock.RLock()
 	ops := s.totalOperations
@@ -168,7 +159,6 @@ func (s *storageEngine) getInfo() (map[string]interface{}, error) {
 	var totalKeys int64 = 0
 	var totalSize int64 = 0
 
-	// Note: ReadDir is expensive on large directories; avoid frequent calls in high-load paths.
 	entries, err := os.ReadDir(s.storageDir)
 	if err != nil {
 		log.Printf("Error scanning storage dir: %v", err)
@@ -243,7 +233,6 @@ func registerAndHeartbeat(ctx context.Context, etcdClient *clientv3.Client, node
 		for {
 			select {
 			case <-ctx.Done():
-				// Context cancelled, revoke lease immediately
 				etcdClient.Revoke(context.Background(), leaseID)
 				log.Printf("[%s] Shutting down, lease revoked.", nodeName)
 				return
@@ -253,7 +242,6 @@ func registerAndHeartbeat(ctx context.Context, etcdClient *clientv3.Client, node
 					log.Printf("[%s] Warning: KeepAlive channel closed. Re-registering...", nodeName)
 					break // Break inner loop to re-register
 				}
-				// Heartbeat received
 				_ = ka
 			}
 		}
@@ -266,7 +254,6 @@ func main() {
 	_ = config.Colors
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	// 1. Load Environment Variables
 	nodePort := os.Getenv("NODE_PORT")
 	nodeName := os.Getenv("NODE_NAME")
 	storageDir := os.Getenv("STORAGE_DIR")
@@ -274,26 +261,29 @@ func main() {
 		log.Fatal("Error: NODE_PORT, NODE_NAME, and STORAGE_DIR must be set.")
 	}
 
-	// 2. Initialize Etcd Client
 	etcdClient := etcd.GetClient()
 	if etcdClient == nil {
 		log.Fatalf("Failed to connect to Etcd. Cannot start Storage Node.")
 	}
 	defer etcd.CloseClient()
 
-	// 3. Initialize Storage Engine (Async IO)
 	storage := newStorageEngine(nodePort, nodeName, storageDir)
 
-	// 4. Start Registration & Heartbeat (Background)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Construct the internal URL that other services (API/Healer) will use to call this node
 	internalURL := fmt.Sprintf("http://%s:%s", nodeName, nodePort)
 	go registerAndHeartbeat(ctx, etcdClient, nodeName, internalURL)
 
 	// 5. Start Gin Server
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
+	
+	// [CRITICAL CHANGE] Use gin.New() instead of gin.Default()
+	// gin.Default() uses Logger() middleware which prints to stdout for every request.
+	// This synchronous I/O kills performance in high throughput benchmarks.
+	router := gin.New()
+	
+	// Only add Recovery middleware to prevent crashes
+	router.Use(gin.Recovery()) 
 
 	// 6. Bind Routes
 	router.GET("/health", func(c *gin.Context) {
@@ -325,15 +315,12 @@ func main() {
 			return
 		}
 
-		// Call async store. Error is returned only if the queue is full.
 		size, err := storage.store(key, data)
 		if err != nil {
-			// Return 503 if the node is overloaded
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			return
 		}
 
-		// Respond immediately (Write-Back)
 		info, _ := storage.getInfo()
 		c.JSON(http.StatusOK, gin.H{
 			"status":     "ok",
