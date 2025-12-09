@@ -2,16 +2,18 @@ module hybrid_distributed_store
 
 // 我們將 Go 版本升級到 1.22，
 // 以滿足 etcd 3.5.16 的依賴需求
-go 1.24
+go 1.24.0
 
 // 我們只列出「直接」依賴。
 // Go 語言 (go mod download) 會自動解析
 // 這些模組所需要的「間接」依賴 (例如 genproto)。
 require (
-	github.com/gin-gonic/gin v1.10.0 // Gin Web 框架 (用於 api, storage_node)
-	github.com/google/uuid v1.6.0 // 用於 writeservice 的 txn_id
-	github.com/klauspost/reedsolomon v1.12.1 // EC 糾刪碼函式庫
-	go.etcd.io/etcd/client/v3 v3.6.6 // etcd 官方 v3 客戶端 (gRPC)
+	github.com/gin-gonic/gin v1.10.0
+	github.com/google/uuid v1.6.0
+	// [Fix] 強制升級 compress 以解決 v1.18.1 的撤回警告
+	github.com/klauspost/compress v1.18.1 // indirect
+	github.com/klauspost/reedsolomon v1.12.1
+	go.etcd.io/etcd/client/v3 v3.6.6
 )
 
 require (
@@ -49,7 +51,6 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
@@ -84,10 +85,10 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/arch v0.8.0 // indirect
-	golang.org/x/crypto v0.36.0 // indirect
-	golang.org/x/net v0.38.0 // indirect
-	golang.org/x/sys v0.31.0 // indirect
-	golang.org/x/text v0.23.0 // indirect
+	golang.org/x/crypto v0.45.0 // indirect
+	golang.org/x/net v0.47.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
