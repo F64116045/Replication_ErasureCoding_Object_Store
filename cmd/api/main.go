@@ -198,8 +198,8 @@ func main() {
 	etcdClient := etcdclient.GetClient()
 	httpClient := httpclient.GetClient()
 	
-	// Initialize Redpanda (Kafka) Client
-	mqClient := mq.NewClient()
+	// [FIX] Initialize Redpanda Client with isConsumer=false
+	mqClient := mq.NewClient(false)
 	defer mqClient.Close()
 
 	utilsSvc := utils.NewService()
@@ -217,8 +217,10 @@ func main() {
 	go watchNodesTask(ctx, etcdClient)
 
 	// 3. Setup Router
+	// Use gin.New() to avoid default Logger middleware which impacts performance benchmarks
+	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
-	//router.Use(gin.Logger())
+	router.Use(gin.Recovery()) // Keep recovery for stability
 	router.Use(PanicRecoveryMiddleware)
 
 	// --- Write Endpoint ---
@@ -234,8 +236,6 @@ func main() {
 			return
 		}
 
-		// [CLEAN FIX] Use separate variables `opResult` and `opErr`.
-		// This prevents variable shadowing inside the switch statement.
 		var opResult map[string]interface{}
 		var opErr error
 		var dataDict map[string]interface{}
@@ -260,13 +260,11 @@ func main() {
 
 		switch strategy {
 		case config.StrategyReplication, config.StrategyEC:
-			bodyBytes, errSerialize := utilsSvc.Serialize(dataDict)
-			if errSerialize != nil {
-				panic(fmt.Errorf("JSON serialization failed: %v", errSerialize))
+			bodyBytes, errSer := utilsSvc.Serialize(dataDict)
+			if errSer != nil {
+				panic(fmt.Errorf("JSON serialization failed: %v", errSer))
 			}
 			if strategy == config.StrategyReplication {
-				// [CLEAN FIX] Use direct assignment (=), NOT declaration (:=)
-				// This ensures we are writing to the `opResult` declared outside.
 				opResult, opErr = writeSvc.WriteReplication(c.Request.Context(), replicaNodes, key, bodyBytes)
 			} else {
 				opResult, opErr = writeSvc.WriteEC(c.Request.Context(), ecNodes, key, bodyBytes)
@@ -283,8 +281,9 @@ func main() {
 			return
 		}
 
-		// We assume writeService follows the contract and returns a non-nil map on success.
-		// The panic fix is the correct variable scoping above, so no "defensive if" is needed here.
+		if opResult == nil {
+			opResult = make(map[string]interface{})
+		}
 
 		opResult["status"] = "ok"
 		opResult["strategy"] = string(strategy)
@@ -382,7 +381,6 @@ func main() {
 		}
 
 		if len(metadata) > 0 {
-			// Case A: Normal Delete
 			log.Printf("%sDelete [Index Found] key=%s%s\n", config.Colors["RED"], key, config.Colors["RESET"])
 			strategyStr, _ = metadata["strategy"].(string)
 
@@ -417,7 +415,6 @@ func main() {
 			}
 
 		} else {
-			// Case B: Blind Delete (Cleanup Zombie Data)
 			log.Printf("%sDelete [Index Not Found] key=%s. Executing Blind Delete...%s\n", config.Colors["YELLOW"], key, config.Colors["RESET"])
 			strategyStr = "blind_delete"
 
