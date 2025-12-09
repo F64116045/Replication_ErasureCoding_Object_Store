@@ -28,7 +28,7 @@ This system addresses the write amplification problem inherent in traditional ob
 
 The system is deployed as a microservices cluster via Docker Compose:
 
-```
+```mermaid
 graph TD
     User[Client] -->|HTTP :8000| LB[Nginx Load Balancer]
     LB --> API[API Gateway Cluster x3]
