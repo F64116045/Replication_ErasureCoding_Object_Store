@@ -34,8 +34,8 @@ graph TD
     LB --> API[API Gateway Cluster x3]
 
     subgraph Control Plane
-        API -->|WAL Append (Sequential IO)| RP[Redpanda / Kafka]
-        API -->|Metadata Commit (Random IO)| Etcd[Etcd Cluster x3]
+        API -->|WAL Append | RP[Redpanda / Kafka]
+        API -->|Metadata Commit | Etcd[Etcd Cluster x3]
     end
 
     subgraph Data Plane
@@ -47,7 +47,6 @@ graph TD
         Healer[Healer Service] -.->|Consume Log| RP
         Healer -.->|Repair Data| SN
     end
-
 ```
 
 ### Component Roles
