@@ -21,6 +21,7 @@ import (
 	etcdclient "hybrid_distributed_store/internal/etcd"
 	"hybrid_distributed_store/internal/httpclient"
 	"hybrid_distributed_store/internal/monitoringservice"
+	"hybrid_distributed_store/internal/mq"
 	"hybrid_distributed_store/internal/readservice"
 	"hybrid_distributed_store/internal/storageops"
 	"hybrid_distributed_store/internal/utils"
@@ -35,12 +36,10 @@ var (
 	nodesReady      = false
 )
 
-
 // watchNodesTask monitors Etcd for storage node registration/deregistration.
 func watchNodesTask(ctx context.Context, etcdClient *etcd.Client) {
 	keyPrefix := "nodes/health/"
 	log.Printf("%s[API] Service Discovery started. Watching prefix: '%s'%s\n", config.Colors["CYAN"], keyPrefix, config.Colors["RESET"])
-
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -49,7 +48,6 @@ func watchNodesTask(ctx context.Context, etcdClient *etcd.Client) {
 		}
 		log.Printf("%s[API-Watcher] Service Discovery stopped.%s\n", config.Colors["RED"], config.Colors["RESET"])
 	}()
-
 
 	// 1. Initial Fetch
 	rangeResp, err := etcdClient.Get(ctx, keyPrefix, etcd.WithPrefix())
@@ -71,15 +69,12 @@ func watchNodesTask(ctx context.Context, etcdClient *etcd.Client) {
 		}
 		log.Printf("%s[API] Initial Nodes: %v%s\n", config.Colors["CYAN"], getKeys(ActiveNodeURLs), config.Colors["RESET"])
 		
-		// If we have enough nodes initially, signal readiness
 		if len(ActiveNodeURLs) >= config.K && !nodesReady {
 			nodesReady = true
 			close(NodesReadyEvent)
 		}
 		NodeListLock.Unlock()
 	}
-
-
 
 	// 2. Watch Loop
 	watchChan := etcdClient.Watch(ctx, keyPrefix, etcd.WithPrefix())
@@ -116,7 +111,6 @@ func watchNodesTask(ctx context.Context, etcdClient *etcd.Client) {
 				if _, exists := ActiveNodeURLs[nodeName]; exists {
 					log.Printf("%s[API] Node Lost: %s%s\n", config.Colors["RED"], nodeName, config.Colors["RESET"])
 					delete(ActiveNodeURLs, nodeName)
-					// If nodes drop below minimum, reset readiness? (Optional logic, strict mode below)
 					if len(ActiveNodeURLs) < config.K && nodesReady {
 						nodesReady = false
 						NodesReadyEvent = make(chan struct{})
@@ -127,9 +121,6 @@ func watchNodesTask(ctx context.Context, etcdClient *etcd.Client) {
 		NodeListLock.Unlock()
 	}
 }
-
-
-
 
 // getDynamicNodes ensures enough nodes are available for operations.
 func getDynamicNodes(c *gin.Context) ([]string, []string, error) {
@@ -149,9 +140,6 @@ func getDynamicNodes(c *gin.Context) ([]string, []string, error) {
 	sort.Strings(allNodes)
 	NodeListLock.RUnlock()
 
-
-	// Simple partitioning strategy: First 3 are replicas, All are EC candidates
-
 	replicaNodes := allNodes
 	if len(allNodes) > 3 {
 		replicaNodes = allNodes[:3]
@@ -169,8 +157,6 @@ func getDynamicNodes(c *gin.Context) ([]string, []string, error) {
 
 	return replicaNodes, ecNodes, nil
 }
-
-
 
 // PanicRecoveryMiddleware handles unhandled panics to prevent server crash.
 func PanicRecoveryMiddleware(c *gin.Context) {
@@ -196,8 +182,6 @@ func PanicRecoveryMiddleware(c *gin.Context) {
 	c.Next()
 }
 
-
-
 func getKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -207,35 +191,35 @@ func getKeys(m map[string]string) []string {
 	return keys
 }
 
-
-
 func main() {
 	log.Printf("%sAPI Gateway (PID: %d) Starting...%s\n", config.Colors["GREEN"], os.Getpid(), config.Colors["RESET"])
-
 
 	// 1. Initialize Services
 	etcdClient := etcdclient.GetClient()
 	httpClient := httpclient.GetClient()
 	
+	// Initialize Redpanda (Kafka) Client
+	mqClient := mq.NewClient()
+	defer mqClient.Close()
+
 	utilsSvc := utils.NewService()
 	ecDriver := ec.NewService()
 	storageOpsSvc := storageops.NewService(httpClient)
 	
 	readSvc := readservice.NewService(httpClient, ecDriver, utilsSvc)
-	writeSvc := writeservice.NewService(etcdClient, httpClient, readSvc, ecDriver, utilsSvc)
-
+	
+	// Inject mqClient into WriteService
+	writeSvc := writeservice.NewService(etcdClient, mqClient, httpClient, readSvc, ecDriver, utilsSvc)
 
 	// 2. Start Service Discovery
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go watchNodesTask(ctx, etcdClient)
 
-
 	// 3. Setup Router
 	router := gin.New()
-	router.Use(gin.Logger())
+	//router.Use(gin.Logger())
 	router.Use(PanicRecoveryMiddleware)
-
 
 	// --- Write Endpoint ---
 	router.POST("/write", func(c *gin.Context) {
@@ -245,14 +229,15 @@ func main() {
 		hotOnlyStr := c.Query("hot_only")
 		isHotOnly := strings.ToLower(hotOnlyStr) == "true"
 
-
 		replicaNodes, ecNodes, err := getDynamicNodes(c)
 		if err != nil {
 			return
 		}
 
-
-		var result map[string]interface{}
+		// [CLEAN FIX] Use separate variables `opResult` and `opErr`.
+		// This prevents variable shadowing inside the switch statement.
+		var opResult map[string]interface{}
+		var opErr error
 		var dataDict map[string]interface{}
 
 		contentType := c.GetHeader("Content-Type")
@@ -275,34 +260,38 @@ func main() {
 
 		switch strategy {
 		case config.StrategyReplication, config.StrategyEC:
-			bodyBytes, err := utilsSvc.Serialize(dataDict)
-			if err != nil {
-				panic(fmt.Errorf("JSON serialization failed: %v", err))
+			bodyBytes, errSerialize := utilsSvc.Serialize(dataDict)
+			if errSerialize != nil {
+				panic(fmt.Errorf("JSON serialization failed: %v", errSerialize))
 			}
 			if strategy == config.StrategyReplication {
-				result, err = writeSvc.WriteReplication(c.Request.Context(), replicaNodes, key, bodyBytes)
+				// [CLEAN FIX] Use direct assignment (=), NOT declaration (:=)
+				// This ensures we are writing to the `opResult` declared outside.
+				opResult, opErr = writeSvc.WriteReplication(c.Request.Context(), replicaNodes, key, bodyBytes)
 			} else {
-				result, err = writeSvc.WriteEC(c.Request.Context(), ecNodes, key, bodyBytes)
+				opResult, opErr = writeSvc.WriteEC(c.Request.Context(), ecNodes, key, bodyBytes)
 			}
 		case config.StrategyFieldHybrid:
-			result, err = writeSvc.WriteFieldHybrid(c.Request.Context(), replicaNodes, ecNodes, key, dataDict, isHotOnly)
+			opResult, opErr = writeSvc.WriteFieldHybrid(c.Request.Context(), replicaNodes, ecNodes, key, dataDict, isHotOnly)
 		default:
 			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Invalid strategy"})
 			return
 		}
 
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if opErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": opErr.Error()})
 			return
 		}
 
-		result["status"] = "ok"
-		result["strategy"] = string(strategy)
-		result["key"] = key
-		result["latency_ms"] = time.Since(start).Milliseconds()
-		c.JSON(http.StatusOK, result)
-	})
+		// We assume writeService follows the contract and returns a non-nil map on success.
+		// The panic fix is the correct variable scoping above, so no "defensive if" is needed here.
 
+		opResult["status"] = "ok"
+		opResult["strategy"] = string(strategy)
+		opResult["key"] = key
+		opResult["latency_ms"] = time.Since(start).Milliseconds()
+		c.JSON(http.StatusOK, opResult)
+	})
 
 	// --- Read Endpoint ---
 	router.GET("/read/:key", func(c *gin.Context) {
@@ -364,7 +353,6 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Unknown strategy in metadata: %s", strategyStr)})
 		}
 	})
-
 
 	// --- Delete Endpoint ---
 	router.DELETE("/delete/:key", func(c *gin.Context) {
@@ -448,7 +436,6 @@ func main() {
 		c.JSON(http.StatusOK, result)
 	})
 
-
 	// --- Monitoring Endpoints ---
 	router.GET("/node_status", func(c *gin.Context) {
 		var currentNodes []string
@@ -471,7 +458,6 @@ func main() {
 		c.JSON(http.StatusOK, statusMap)
 	})
 
-
 	router.GET("/storage_usage", func(c *gin.Context) {
 		var currentNodes []string
 		NodeListLock.RLock()
@@ -493,7 +479,6 @@ func main() {
 		c.JSON(http.StatusOK, usageMap)
 	})
 
-
 	router.GET("/health", func(c *gin.Context) {
 		hostname, _ := os.Hostname()
 		c.JSON(http.StatusOK, gin.H{
@@ -503,7 +488,6 @@ func main() {
 		})
 	})
 
-	
 	// 4. Start Server
 	log.Println("[API] Starting Gin Server on 0.0.0.0:8000...")
 	if err := router.Run("0.0.0.0:8000"); err != nil {

@@ -13,28 +13,28 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	etcd "go.etcd.io/etcd/client/v3"
 
 	"hybrid_distributed_store/internal/config"
 	"hybrid_distributed_store/internal/interfaces"
+	"hybrid_distributed_store/internal/mq"
 )
 
-// Service implements the write logic for Replication, EC, and Hybrid strategies.
-// It handles distributed transactions using an Etcd-backed Write-Ahead Log .
+// Service implements the write logic using Redpanda for WAL (Write-Ahead Log)
+// and Etcd for Metadata storage. This separation ensures high throughput for
+// write intents while maintaining strong consistency for metadata.
 type Service struct {
 	etcd  interfaces.IEtcdClient
+	mq    *mq.Client // Redpanda Client for high-throughput WAL
 	http  interfaces.IHttpClient
 	read  interfaces.IReadService
 	ec    interfaces.IEcDriver
 	utils interfaces.IUtilsSvc
 }
 
-
-
-
-// NewService creates a new WriteService.
+// NewService creates a new WriteService with necessary dependencies.
 func NewService(
 	etcd interfaces.IEtcdClient,
+	mqClient *mq.Client,
 	http interfaces.IHttpClient,
 	read interfaces.IReadService,
 	ec interfaces.IEcDriver,
@@ -42,6 +42,7 @@ func NewService(
 ) *Service {
 	return &Service{
 		etcd:  etcd,
+		mq:    mqClient,
 		http:  http,
 		read:  read,
 		ec:    ec,
@@ -49,22 +50,17 @@ func NewService(
 	}
 }
 
-
-
-
 // computeSHA256Hex generates a SHA256 hash string for data fingerprinting.
 func computeSHA256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
+// --- Write-Ahead Log Helpers (Redpanda Version) ---
 
-
-
-// --- Write-Ahead Log Helpers ---
-
-// createWALEntry creates a "PENDING" transaction record in Etcd.
-// This ensures that if the process crashes during writing, the system knows there was an incomplete transaction.
+// createWALEntry writes the "PENDING" transaction record to Redpanda (Kafka).
+// Writing to Redpanda is significantly faster than Etcd due to sequential I/O,
+// allowing for higher write throughput.
 func (s *Service) createWALEntry(
 	ctx context.Context,
 	key string,
@@ -72,36 +68,35 @@ func (s *Service) createWALEntry(
 	metadataDetails map[string]interface{},
 ) (string, error) {
 
-	txnID := fmt.Sprintf("txn/%s", uuid.New().String())
+	txnID := fmt.Sprintf("txn:%s", uuid.New().String())
 
 	logEntry := map[string]interface{}{
+		"txn_id":    txnID,
 		"status":    "PENDING",
 		"key_name":  key,
 		"strategy":  string(strategy),
 		"timestamp": time.Now().Unix(),
-	}
-	for k, v := range metadataDetails {
-		logEntry[k] = v
+		"details":   metadataDetails,
 	}
 
-	b, err := json.Marshal(logEntry)
+	valBytes, err := json.Marshal(logEntry)
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize WAL entry: %v", err)
 	}
 
-	_, err = s.etcd.Put(ctx, txnID, string(b))
-	if err != nil {
-		return "", fmt.Errorf("failed to write WAL to etcd: %v", err)
+	// Write to Redpanda synchronously to ensure durability.
+	// The object 'key' is used as the Kafka Partition Key to preserve ordering if needed.
+	if err := s.mq.ProduceSync(ctx, key, valBytes); err != nil {
+		return "", fmt.Errorf("failed to write WAL to Redpanda: %v", err)
 	}
 
 	return txnID, nil
 }
 
-
-
-
-// finalizeWALEntry commits or rolls back the transaction.
-// If success is true, it atomically updates the object metadata and deletes the WAL entry.
+// finalizeWALEntry commits the metadata to Etcd.
+// Unlike traditional database WALs, we do not delete the log from Redpanda immediately
+// after commit. Instead, we update the source of truth (Etcd Metadata) to mark the
+// data as valid and visible.
 func (s *Service) finalizeWALEntry(
 	ctx context.Context,
 	txnID string,
@@ -111,8 +106,9 @@ func (s *Service) finalizeWALEntry(
 ) error {
 
 	if !success {
-		// Mark as FAILED. The Healer service usually cleans this up.
-		s.etcd.Put(ctx, txnID+"/status", "FAILED")
+		// If the operation failed, we simply do nothing here.
+		// The Healer service is responsible for detecting stalled PENDING logs
+		// in Redpanda and reconciling the state eventually.
 		return nil
 	}
 
@@ -122,28 +118,16 @@ func (s *Service) finalizeWALEntry(
 		return fmt.Errorf("failed to serialize final metadata: %v", err)
 	}
 
-
-	// Atomic Commit: Only update metadata if the WAL entry still exists and is valid.
-	txn := s.etcd.Txn(ctx)
-	resp, err := txn.If(
-		etcd.Compare(etcd.Version(txnID), ">", 0),
-	).Then(
-		etcd.OpPut(metaKey, string(metaBytes)),
-		etcd.OpDelete(txnID),
-	).Commit()
-
+	// Commit to Etcd.
+	// This is the point of "Strong Consistency". Once this succeeds,
+	// the data is globally visible to readers.
+	_, err = s.etcd.Put(ctx, metaKey, string(metaBytes))
 	if err != nil {
-		return fmt.Errorf("failed to commit WAL transaction: %v", err)
-	}
-	if !resp.Succeeded {
-		return fmt.Errorf("WAL commit failed: txnID likely expired or modified")
+		return fmt.Errorf("failed to commit metadata to Etcd: %v", err)
 	}
 
 	return nil
 }
-
-
-
 
 // --- Strategy A: Replication ---
 
@@ -159,11 +143,14 @@ func (s *Service) WriteReplication(
 		"strategy": config.StrategyReplication,
 	}
 
+	// Step 1: Write Intent to WAL (Redpanda)
 	txnID, err := s.createWALEntry(ctx, key, config.StrategyReplication, walMeta)
 	if err != nil {
 		return nil, err
 	}
 
+	// Step 2: Write Payload to Storage Nodes
+	// Since storage nodes implement async write-back I/O, this operation is non-blocking.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	success := 0
@@ -188,13 +175,10 @@ func (s *Service) WriteReplication(
 	}
 	wg.Wait()
 
-
-	// Quorum check: stricter than 1, but here we require ALL nodes for simplicity
+	// Quorum check
 	if success < len(replicaNodes) {
-		_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 		return nil, fmt.Errorf("replication failed: success %d / required %d", success, len(replicaNodes))
 	}
-
 
 	finalMeta := map[string]interface{}{
 		"strategy":     string(config.StrategyReplication),
@@ -203,7 +187,7 @@ func (s *Service) WriteReplication(
 		"cold_hash":    "",
 	}
 
-
+	// Step 3: Commit Metadata to Etcd
 	if err := s.finalizeWALEntry(ctx, txnID, true, key, finalMeta); err != nil {
 		return nil, err
 	}
@@ -212,8 +196,6 @@ func (s *Service) WriteReplication(
 		"nodes_written": replicaNodes,
 	}, nil
 }
-
-
 
 // --- Strategy B: Erasure Coding (EC) ---
 
@@ -236,22 +218,22 @@ func (s *Service) WriteEC(
 		"key_name":        key,
 	}
 
+	// 1. Write Intent to WAL
 	txnID, err := s.createWALEntry(ctx, key, config.StrategyEC, walMeta)
 	if err != nil {
 		return nil, err
 	}
 
-	// Split & Encode
+	// 2. Split & Encode (CPU Intensive)
 	chunks, err := s.ec.Split(value)
 	if err != nil {
-		_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 		return nil, fmt.Errorf("EC split failed: %v", err)
 	}
 	if err := s.ec.Encode(chunks); err != nil {
-		_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 		return nil, fmt.Errorf("EC encode failed: %v", err)
 	}
 
+	// 3. Write Shards to Storage Nodes
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	success := 0
@@ -282,7 +264,6 @@ func (s *Service) WriteEC(
 	wg.Wait()
 
 	if success < totalChunks {
-		_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 		return nil, fmt.Errorf("EC write failed: success %d / required %d", success, totalChunks)
 	}
 
@@ -294,6 +275,7 @@ func (s *Service) WriteEC(
 	finalMeta["cold_version"] = time.Now().UnixNano()
 	finalMeta["cold_hash"] = computeSHA256Hex(value)
 
+	// 4. Commit Metadata to Etcd
 	if err := s.finalizeWALEntry(ctx, txnID, true, key, finalMeta); err != nil {
 		return nil, err
 	}
@@ -304,13 +286,11 @@ func (s *Service) WriteEC(
 	}, nil
 }
 
-
-
 // --- Strategy C: Field-level Hybrid ---
 
-// WriteFieldHybrid separates JSON into Hot/Cold fields.
-// OPTIMIZATION: It calculates the hash of cold fields and skips EC operations
-// if the cold data hasn't changed ("Pure Hot Update").
+// WriteFieldHybrid intelligently separates JSON into Hot and Cold fields.
+// It computes the hash of the cold part to detect if it has changed.
+// If the cold data is unchanged ("Pure Hot Update"), it skips the expensive EC operations.
 func (s *Service) WriteFieldHybrid(
 	ctx context.Context,
 	replicaNodes, ecNodes []string,
@@ -328,7 +308,8 @@ func (s *Service) WriteFieldHybrid(
 	// 1. Separate Fields
 	newHot, newCold := s.utils.SeparateHotColdFields(dataDict)
 
-	// 2. Fetch Old Metadata (to check for changes)
+	// 2. Fetch Old Metadata from Etcd (Read Operation)
+	// We need this to compare the cold data hash.
 	metaKey := fmt.Sprintf("metadata/%s", key)
 	resp, _ := s.etcd.Get(ctx, metaKey)
 
@@ -354,16 +335,15 @@ func (s *Service) WriteFieldHybrid(
 	newColdBytes, _ := s.utils.Serialize(newCold)
 	newColdHash := computeSHA256Hex(newColdBytes)
 
-
-	// Determine Optimization: Is this a Pure Hot Update?
+	// 4. Determine Optimization Path
+	// If hashes match, we skip EC encoding and writing, saving significant I/O.
 	isPureHot := (newColdHash == oldColdHash)
 	if hotOnly {
 		log.Printf("[HYBRID] TraceID=%s Forced HotOnly mode.\n", traceID)
 		isPureHot = true
 	}
 
-
-	// 4. Create WAL Entry
+	// 5. Write Intent to WAL
 	walMeta := map[string]interface{}{
 		"strategy":        config.StrategyFieldHybrid,
 		"hot_key":         hotKey,
@@ -375,14 +355,12 @@ func (s *Service) WriteFieldHybrid(
 		"trace_id":        traceID,
 	}
 
-
 	txnID, err := s.createWALEntry(ctx, key, config.StrategyFieldHybrid, walMeta)
 	if err != nil {
 		return nil, err
 	}
 
-
-	// 5. Write Hot Fields (Replication) - Always executed
+	// 6. Write Hot Fields (Replication) - This is always executed as hot data is assumed to change.
 	hotBytes, _ := s.utils.Serialize(newHot)
 	var wg sync.WaitGroup
 	var hotMu sync.Mutex
@@ -407,9 +385,7 @@ func (s *Service) WriteFieldHybrid(
 		}(url)
 	}
 
-
-
-	// 6. Write Cold Fields (EC) - Executed ONLY if cold data changed
+	// 7. Write Cold Fields (EC) - Executed ONLY if cold data actually changed.
 	var coldMu sync.Mutex
 	coldSuccess := 0
 	totalCold := 0
@@ -419,12 +395,10 @@ func (s *Service) WriteFieldHybrid(
 		
 		chunks, err := s.ec.Split(newColdBytes)
 		if err != nil {
-			_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 			return nil, fmt.Errorf("EC split failed: %v", err)
 		}
 
 		if err := s.ec.Encode(chunks); err != nil {
-			_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 			return nil, fmt.Errorf("EC encode failed: %v", err)
 		}
 
@@ -453,26 +427,22 @@ func (s *Service) WriteFieldHybrid(
 
 	wg.Wait()
 
-
 	// Validate Success Rates
 	if hotSuccess < len(replicaNodes) {
-		_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 		return nil, fmt.Errorf("Hybrid hot write failed: success %d / required %d", hotSuccess, len(replicaNodes))
 	}
 	if !isPureHot && coldSuccess < totalCold {
-		_ = s.finalizeWALEntry(ctx, txnID, false, key, nil)
 		return nil, fmt.Errorf("Hybrid cold chunks write failed: success %d / required %d", coldSuccess, totalCold)
 	}
 
-
-	// 7. Finalize Metadata
+	// 8. Commit Metadata to Etcd
 	finalMeta := map[string]interface{}{}
 	for k, v := range walMeta {
 		finalMeta[k] = v
 	}
 
 	finalMeta["hot_version"] = time.Now().UnixNano()
-	// If cold data didn't change, keep the old version and hash
+	// Maintain old cold version/hash if pure hot update
 	if isPureHot {
 		finalMeta["cold_version"] = oldColdVersion
 		finalMeta["cold_hash"] = oldColdHash
