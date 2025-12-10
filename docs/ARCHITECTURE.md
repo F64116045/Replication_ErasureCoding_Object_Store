@@ -1,131 +1,178 @@
-# System Architecture
+# **Replication + Erasure Coding Object Store** Architecture
 
-This document describes the internal design, data flows, and consistency models of the Hybrid Distributed Object Store.
+This document provides a comprehensive architectural overview of the Replication + Erasure Coding Object Store. It details the system's design principles, component interactions, data flows, and consistency models.
 
-## 1. High-Level Design
+## 1. System Overview
 
-The system follows a **Control Plane / Data Plane** separation pattern:
+The Replication + Erasure Coding Object Store is designed to balance **Performance** (for hot data) and **Storage Efficiency** (for cold data) using a **Log-Centric Architecture**.
 
-- **Control Plane (Metadata)**: Managed by **Etcd**. It stores object metadata, transaction logs (WAL), and node health status.
-- **Data Plane (Blob Storage)**: Managed by **Storage Nodes**. They are dumb servers that simply store raw bytes on disk.
-- **Orchestrator**: The **API Gateway** acts as the stateless coordinator, handling logic for striping, replication, and repairing.
+### 1.1 Design Goals
 
-## 2. The Write Path (Atomic Transactions)
+- **Durability**: Zero data loss once a write is acknowledged (via WAL).
+- **Efficiency**: Minimize storage overhead for large blobs using Erasure Coding.
+- **Self-Healing**: Automatic recovery from node failures without human intervention.
+- **Consistency**: Strong consistency for metadata (Etcd), Eventual consistency for object blobs.
 
-To ensure data consistency across multiple nodes, we implement a **Two-Phase Commit** protocol using an Etcd-backed Write-Ahead Log (WAL).
+### 1.2 CAP Theorem Positioning
 
-### Workflow Diagram
+- **Metadata (CP)**: We use Etcd to guarantee linearizable consistency for file metadata and node locking.
+- **Storage (AP)**: Storage nodes prioritize availability. Inconsistencies are resolved asynchronously by the **Healer**.
+
+## 2. Core Components
+
+The system separates concerns into three distinct planes:
+
+### A. Control Plane
+
+- **Etcd Cluster**:
+    - Acts as the **Source of Truth**.
+    - Stores file metadata (file size, strategy, node location maps).
+    - Handles distributed locking for Leader Election.
+    - Stores Service Discovery records (`nodes/health/`).
+- **Healer Service**:
+    - A stateless worker that performs reconciliation.
+    - Active-Standby HA model via Etcd Election.
+    - Responsible for repairing lost replicas and reconstructing missing EC shards.
+
+### B. Event Plane
+
+- **Redpanda** :
+    - Acts as the **Write-Ahead Log (WAL)**.
+    - Decouples ingestion from processing.
+    - Ensures write requests are durable even if the API Gateway crashes mid-processing.
+
+### C. Data Plane
+
+- **Storage Nodes**:
+    - Stateless HTTP servers.
+    - Store raw bytes on the local filesystem.
+    - No knowledge of the cluster topology.
+- **API Gateway**:
+    - Handles client HTTP requests.
+    - Performs Erasure Coding (Reed-Solomon) encoding/decoding.
+    - Manages sharding logic and node selection.
+
+## 3. Data Flow: The Write Path (Log-Centric)
+
+The write path is designed to be **Crash-Safe**.
+
+### Workflow
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant API as API Gateway
-    participant Etcd as Etcd (WAL)
+    participant RP as Redpanda (WAL)
+    participant Etcd as Etcd
     participant SN as Storage Nodes
 
-    C->>API: POST /write (JSON Data)
+    Note left of C: User Uploads JSON
+    C->>API: POST /write
 
-    Note over API: 1. Strategy Analysis
-    API->>API: Split Hot/Cold Fields
-    API->>API: Calculate Cold Hash (SHA256)
+    Note over API: 1. Durability First
+    API->>RP: Produce Event (Topic: wal-events)
+    RP-->>API: ACK (Offset X)
 
-    Note over API: 2. Prepare Phase
-    API->>Etcd: PUT txn/{uuid} (Status: PENDING)
+    Note over API: 2. Strategy Analysis
+    API->>API: Parse JSON -> Split Hot/Cold
+    API->>API: Calculate Hash (SHA-256)
 
-    Note over API: 3. Execution Phase
-    par Write Hot Data
-        API->>SN: POST /store (Replica)
-    and Write Cold Data
-        API->>SN: POST /store (EC Shards)
+    Note over API: 3. Distribution
+    par Write Replicas (Hot)
+        API->>SN: POST /store (Node 1,2,3)
+    and Write Shards (Cold)
+        API->>SN: POST /store (Node 1..6)
     end
 
-    Note over API: 4. Commit Phase
-    alt Write Success
-        API->>Etcd: Txn( Put Metadata, Delete WAL )
+    Note over API: 4. Finalize
+    alt All Writes Success
+        API->>Etcd: PUT metadata/{key}
         API-->>C: 200 OK
-    else Write Failed
-        API->>Etcd: Update WAL -> FAILED
-        API-->>C: 500 Error
+    else Partial Failure
+        API->>Etcd: PUT metadata/{key} (Marked Dirty)
+        API-->>C: 202 Accepted (Repair Scheduled)
     end
+
 ```
 
-### Transaction States
+## 4. Data Flow: The Read Path
 
-Every write operation creates a temporary key in Etcd under `txn/`.
+The read path differs significantly based on the storage strategy.
 
-1. **PENDING**: The write operation is in progress. If the API crashes here, the `Healer` will detect the stale timestamp and rollback.
-2. **COMMITTED**: The atomic transaction in Etcd converts the WAL entry into a permanent `metadata/` entry.
-3. **FAILED**: The write failed (e.g., not enough storage nodes). The `Healer` will garbage collect the partial data.
-
-## 3. Storage Strategies
-
-### A. Replication (Hot Data)
-
-- **Use Case**: Small, frequently accessed data (e.g. `like_count`, `last_updated`).
-- **Mechanism**: Full copies are stored on 3 nodes.
-- **Read Consistency**: First-response-wins .
-
-### B. Erasure Coding (Cold Data)
-
-- **Use Case**: Large blobs (e.g. `biography`).
-- **Algorithm**: Reed-Solomon (K=4, M=2).
-- **Fault Tolerance**: Can tolerate loss of any 2 nodes.
-- **Padding**: Data is zero-padded to fit the matrix requirements. `original_length` is stored in metadata to truncate padding on read.
-
-### C. Field-Level Hybrid
-
-The system parses the input JSON and separates fields based on `config.HotFields`.
-
-**Optimization: Pure Hot Updates**
-When a write request comes in, the system calculates `SHA256(NewColdData)`.
-
-- If `NewHash == OldHash`: **Skip EC Encoding & Writing**. Only update the Hot Data replicas.
-- If `NewHash != OldHash`: Perform full EC split and write.
-
-## 4. The Healer (Self-Healing)
-
-The Healer service runs in the background to ensure system consistency. It uses **Leader Election** to prevent race conditions.
-
-### Healer State Machine
+### Workflow
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Follower
-    Follower --> Candidate: Campaign for Lock
-    Candidate --> Leader: Win Election
+sequenceDiagram
+    participant C as Client
+    participant API as API Gateway
+    participant Etcd as Etcd
+    participant SN as Storage Nodes
 
-    state Leader {
-        [*] --> Phase1_Rollback
-        Phase1_Rollback --> Phase2_Audit
+    C->>API: GET /read/{key}
+    API->>Etcd: GET metadata/{key}
+    Etcd-->>API: Returns Strategy & Map
 
-        state Phase1_Rollback {
-            [*] --> ScanWAL
-            ScanWAL --> CleanZombieFiles: Found Stalled/Failed Txn
-        }
+    alt Strategy: Replication
+        API->>SN: HEAD Request (Check latency)
+        API->>SN: GET /retrieve/{key} (Fastest Node)
+        SN-->>API: Raw JSON
+    else Strategy: Erasure Coding
+        Note over API: Need K shards to reconstruct
+        par Fetch Shards
+            API->>SN: GET /retrieve/{chunk_0}
+            API->>SN: GET /retrieve/{chunk_1}
+            API->>SN: ...
+        end
+        API->>API: Reed-Solomon Reconstruct
+    end
 
-        state Phase2_Audit {
-            [*] --> ScanMetadata
-            ScanMetadata --> CheckReplicas
-            ScanMetadata --> CheckEC
-            CheckReplicas --> RepairReplica: Missing Copy
-            CheckEC --> Reconstruct: Missing Shards < M
-        }
-    }
+    API->>API: Merge Hot + Cold fields
+    API-->>C: Unified JSON Response
 
-    Leader --> Follower: Resign / Crash
 ```
 
-1. **Leader Election**: Uses `concurrency.Election` from Etcd. Only one Healer is active at a time.
-2. **Rollback (Phase 1)**: Scans `txn/` keys. If a transaction is `PENDING` for > 5 minutes or marked `FAILED`, it deletes the physical files on storage nodes to free up space.
-3. **Repair (Phase 2)**: Scans `metadata/` keys.
-    - **Replica Repair**: If a node is down, copies data from a healthy node to a new node.
-    - **EC Repair**: If shards are missing, uses Reed-Solomon `Reconstruct` to regenerate missing chunks and upload them.
+## 5. Storage Strategies
 
-## 5. Data Layout
+We employ a hybrid approach to optimize costs.
 
-### Etcd Keys
+| Feature | Replication | Erasure Coding (RS 4+2) |
+| --- | --- | --- |
+| **Target Data** | Hot Data (Counters, Status, Small Metadata) | Cold Data (Bios, Long Descriptions, Blobs) |
+| **Redundancy** | 3x Copies (300% storage overhead) | 1.5x Overhead (4 Data + 2 Parity) |
+| **Fault Tolerance** | Tolerate 2 node failures | Tolerate 2 node failures |
+| **Read Perf** | High (Low latency, parallel read) | Medium (CPU overhead for reconstruction) |
+| **Write Perf** | High | Medium (CPU overhead for encoding) |
 
-- `nodes/health/{hostname}`: Service discovery heartbeat.
-- `metadata/{key}`: JSON object containing strategy, file size, node map, and checksums.
-- `txn/{uuid}`: Temporary transaction log.
-- `healer_leader_lock`: Distributed lock for the Healer.
+### Field-Level Hybrid Logic
+
+When a JSON object is updated:
+
+1. **Hash Check**: The system calculates the SHA-256 hash of the Cold fields.
+2. **Deduplication**: If the hash matches the previous version in Etcd, the **EC Write is skipped entirely**. Only the small Hot data is updated via Replication.
+
+## 6. The Healer (Self-Healing Controller)
+
+The Healer ensures the system converges to a healthy state. It operates as a background daemon.
+
+### 6.1 Architecture: Active-Standby
+
+To prevent race conditions (e.g., two nodes trying to repair the same file simultaneously), Healer instances perform **Leader Election**:
+
+- Uses `etcd/concurrency` session with a 15s TTL.
+- Only the **Leader** enters the Control Loop.
+- Others wait on the lock key `/healer/leader`.
+
+### 6.2 The Control Loop (Polling)
+
+Every 30 seconds, the Leader:
+
+1. **Scans**: Lists keys in `metadata/`.
+2. **Audits**: Checks existence of files on Storage Nodes via HTTP HEAD.
+3. **Repairs**:
+    - **Replication Repair**: Copies data from a healthy node -> missing node.
+    - **EC Repair**: Downloads `K` shards -> Reconstructs `M` missing shards -> Uploads to new nodes.
+
+## Limitations & Future Work
+
+- **Sharding**: Currently, node selection is deterministic based on sorting. A Consistent Hashing Ring (e.g., Ringpop) is needed for dynamic node scaling.
+- **Bitrot Detection**: Currently checks for file existence only. Future versions should implement Checksum verification on read/audit.
