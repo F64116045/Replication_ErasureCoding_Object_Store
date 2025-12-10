@@ -1,186 +1,165 @@
-# Healer Service: Manual Testing Guide
+# Healer Service: Manual Testing & Verification Guide
 
-This guide provides step-by-step instructions to verify the **Safety (Concurrency Control)** and **Self-Healing (Auto-Repair)** capabilities of the Healer service.
+This guide outlines the procedures to verify the **Self-Healing** and **Consistency Checking** capabilities of the Healer service within the Log-Centric architecture.
 
-We will use manual CLI tools (`curl` and `docker-compose exec`) to simulate failures and observe the system's recovery behavior.
+Since the Healer operates as a **Redpanda Consumer**, we trigger maintenance tasks by injecting specific log events into the WAL topic.
 
 ## Prerequisites
 
 1. **Start the Cluster**
-Ensure all microservices are running.
+Ensure all services (Redpanda, Etcd, API, Storage Nodes, Healer) are running and healthy.
     
     ```
-    docker-compose up --build
-    ```
-    
-2. **Prepare Test Data**
-Ensure `test/payload.json` exists in your project root.
-3. **Create "V2" Data (The Valid State)**
-We first create a valid object using the Hybrid strategy. This represents the "latest successful write".
+    docker-compose up -d --build
     
     ```
-    # 1. Cleanup (Optional, ensures fresh start)
-    curl -X DELETE http://localhost:8000/delete/healer_full_test
     
-    # 2. Write Data
-    curl -X POST "http://localhost:8000/write?key=healer_full_test&strategy=field_hybrid" \
-         -H "Content-Type: application/json" \
-         -d @test/payload.json
-    
-    # Response should be {"status": "ok", ...}
-    ```
-    
-4. **Monitor Healer Logs**
-Open a **new terminal window** to watch the Healer in action. Keep this open throughout the tests.
+2. **Open Monitoring Terminal**
+Open a separate terminal window to watch Healer's actions in real-time.
     
     ```
     docker-compose logs -f healer
-    ```
-    
-
-## Test 1: Race Condition Safety
-
-**Objective:** Verify that the Healer does **NOT** delete valid data (V2) even if it finds a stale "FAILED" transaction log (V1) for the same key.
-
-### Step 1: Inject Fake Stale Log
-
-We manually inject a "FAILED" transaction record into Etcd, mimicking a scenario where an old write failed, but a newer write succeeded.
-
-1. Open a new terminal.
-2. Enter the Etcd container:
-    
-    ```
-    docker-compose exec etcd0 /bin/sh
-    ```
-    
-3. Insert the fake log using `etcdctl` (inside the container):
-    
-    ```
-    # We create a FAILED log pointing to our valid key "healer_full_test"
-    etcdctl put txn/fake-v1-failed-txn \
-    '{"key_name": "healer_full_test", "strategy": "field_hybrid", "status": "FAILED", "timestamp": 1}'
     
     ```
     
-4. Exit the container:
-    
-    ```
-    exit
-    ```
-    
 
-**Current State:**
+## Test Case 1: Detecting "Zombie" Transactions
 
-- `metadata/healer_full_test`: Exists (Valid Data).
-- `txn/fake-v1-failed-txn`: Exists (Fake Failed Log targeting the same key).
+**Scenario:** The API Gateway crashes after writing to the WAL (Redpanda) but *before* committing Metadata to Etcd. The Healer must detect this inconsistency.
 
-### Step 2: Observe Healer Logs
+### Step 1: Manually Inject a "Zombie" Log
 
-Watch the terminal running `docker-compose logs -f healer`. Wait for the next cycle (approx. 60 seconds).
-
-**Expected Output:**
-The Healer should detect the conflict but **abort** the rollback to protect the data.
+We use the `rpk` tool inside the Redpanda container to simulate a log entry for a key that does not exist in Etcd.
 
 ```
-[HEALER] Detected inconsistent txn (Key: healer_full_test), checking rollback...
-[HEALER] Safety Check: Metadata exists. This is a stale txn log. Skipping delete to prevent data loss.
-[HEALER] Phase 1: Cleaned 1 failed txns.
-
+# Produce a fake WAL entry to the 'wal-events' topic
+echo '{"txn_id":"txn:zombie-test","status":"PENDING","key_name":"ghost_data_key","strategy":"replication","timestamp":1700000000,"details":{}}' | \
+docker-compose exec -T redpanda rpk topic produce wal-events
 ```
 
-### Step 3: Verify Data Integrity
+### Step 2: Verify Alert
 
-Ensure the data is still accessible via the API.
+Check your **Monitoring Terminal**. The Healer should consume this message, check Etcd, find no metadata, and raise an alert.
 
-```
-curl http://localhost:8000/read/healer_full_test
-```
-
-**Pass Condition:** You receive the JSON data (200 OK).
-**Fail Condition:** You receive a 404 Not Found (Data was wrongly deleted).
-
-## Test 2: Self-Healing (Hot Data / Replication)
-
-**Objective:** Verify the Healer detects a missing replica and copies it from a healthy node.
-
-### Step 1: Simulate Data Loss
-
-Hot data is stored on 3 nodes (`storage_node_1`, `_2`, `_3`). We will delete the file from **Node 2**.
+**Expected Log Output:**
 
 ```
-# Delete the hot file directly from the container
-docker-compose exec storage_node_2 rm /data/node2/healer_full_test_hot
+[Healer] ALERT: Data Inconsistency Detected!
+   Txn: txn:zombie-test
+   Key: ghost_data_key
+   Status: Missing in Etcd (Write Lost)
 ```
 
-*(Optional) Verify deletion:*
+## Test Case 2: Repairing Lost Replicas (Hot Data)
+
+**Scenario:** A valid object exists, but one of the Storage Nodes suffers data loss (e.g., disk corruption). The Healer must restore the file from healthy nodes.
+
+### Step 1: Create Valid Data
+
+Use the API to write a standard object using the **Replication** strategy.
 
 ```
-docker-compose exec storage_node_2 ls /data/node2
-# 'healer_full_test_hot' should be missing.
+curl -X POST "http://localhost:8000/write?key=repair_rep_test&strategy=replication" \
+     -H "Content-Type: application/json" \
+     -d '{"mission": "restore_this_data"}'
 
 ```
 
-### Step 2: Observe Healer Logs
+### Step 2: Sabotage a Node
 
-Wait for the next Healer cycle.
-
-**Expected Output:**
+Delete the actual data file from **Storage Node 1**.
 
 ```
-[HEALER] Auditing Replica: healer_full_test (Target: healer_full_test_hot)
-[HEALER] Missing replica on http://storage_node_2:8002. Repairing...
-[HEALER] Repair successful: http://storage_node_2:8002
-```
+# Verify file exists first
+docker-compose exec storage_node_1 ls /data/node1/repair_rep_test
 
-### Step 3: Verify Repair
-
-Check if the file is back on Node 2.
-
-```
-docker-compose exec storage_node_2 ls /data/node2
-```
-
-**Pass Condition:** The file `healer_full_test_hot` appears in the list.
-
-## Test 3: Self-Healing (Cold Data / Erasure Coding)
-
-**Objective:** Verify the Healer detects a missing EC shard and reconstructs it using Reed-Solomon logic.
-
-### Step 1: Simulate Data Loss
-
-Cold data is split across all 6 nodes (Indices 0-5). We will delete **Chunk 4** (located on `storage_node_5`).
-
-```
-# Delete chunk 4
-docker-compose exec storage_node_5 rm /data/node5/healer_full_test_cold_chunk_4
-```
-
-**Current State:**
-
-- Chunk 4 is missing.
-- Chunks 0, 1, 2, 3, 5 exist (5 chunks > K=4). The data is recoverable.
-
-### Step 2: Observe Healer Logs
-
-Wait for the next Healer cycle.
-
-**Expected Output:**
-
-```
-[HEALER] Auditing EC: healer_full_test (healer_full_test_cold_chunk_*)
-[HEALER] Missing 1 chunk(s) for healer_full_test. Healthy: 5
-[HEALER] Reconstructing missing chunks...
-[HEALER] Uploading repaired chunk 4 to http://storage_node_5:8005...
-[HEALER] Repair complete for healer_full_test
-```
-
-### Step 3: Verify Repair
-
-Check if the chunk is back on Node 5.
-
-```
-docker-compose exec storage_node_5 ls /data/node5
+# Delete it
+docker-compose exec storage_node_1 rm /data/node1/repair_rep_test
 
 ```
 
-**Pass Condition:** The file `healer_full_test_cold_chunk_4` appears in the list.
+### Step 3: Trigger Repair (Replay Log)
+
+Since the original WAL log was already consumed, we simulate a "Log Replay" or "Periodic Scan" by re-injecting the log intent.
+
+```
+# Inject the same log entry to trigger the Healer logic again
+echo '{"txn_id":"txn:replay-01","status":"PENDING","key_name":"repair_rep_test","strategy":"replication","timestamp":1700000000,"details":{}}' | \
+docker-compose exec -T redpanda rpk topic produce wal-events
+
+```
+
+### Step 4: Verify Restoration
+
+**1. Check Logs:**
+
+```
+[Healer] Repairing Replication for key: repair_rep_test. Missing on: [http://storage_node_1:8001]
+[Healer] Successfully repaired replica on http://storage_node_1:8001
+
+```
+
+**2. Check Disk:**
+
+```
+docker-compose exec storage_node_1 ls /data/node1/repair_rep_test
+# Output should show the file name, indicating successful recovery.
+
+```
+
+## Test Case 3: Reconstructing EC Shards (Cold Data)
+
+**Scenario:** A large file stored via Erasure Coding loses a chunk. The Healer must use Reed-Solomon logic to reconstruct the missing data from remaining shards.
+
+### Step 1: Create Valid Hybrid Data
+
+Write a large object to trigger the EC strategy (Cold Data).
+
+```
+curl -X POST "http://localhost:8000/write?key=repair_ec_test&strategy=field_hybrid" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "hot_field": 123,
+           "cold_field": "A_LONG_STRING_DATA_FOR_EC_RECONSTRUCTION_TESTING_1234567890"
+         }'
+
+```
+
+### Step 2: Sabotage a Chunk
+
+EC chunks are distributed across nodes. Let's delete **Chunk 2** from **Storage Node 3**.
+
+```
+# Delete the specific chunk file
+docker-compose exec storage_node_3 rm /data/node3/repair_ec_test_cold_chunk_2
+
+```
+
+### Step 3: Trigger Repair
+
+Re-inject the log. Note that we must provide the correct `details` so the Healer knows the naming convention.
+
+```
+# JSON payload matching the Hybrid structure
+echo '{"txn_id":"txn:replay-02","status":"PENDING","key_name":"repair_ec_test","strategy":"field_hybrid","timestamp":1700000000,"details":{"hot_key":"repair_ec_test_hot","cold_prefix":"repair_ec_test_cold_chunk_"}}' | \
+docker-compose exec -T redpanda rpk topic produce wal-events
+
+```
+
+### Step 4: Verify Reconstruction
+
+**1. Check Logs:**
+
+```
+[Healer] Reconstructing EC chunks for repair_ec_test. Missing: [2]
+[Healer] Successfully repaired chunk 2 on http://storage_node_3:8003
+
+```
+
+**2. Check Disk:**
+
+```
+docker-compose exec storage_node_3 ls /data/node3/repair_ec_test_cold_chunk_2
+# Output should show the file name.
+
+```
