@@ -20,18 +20,17 @@ import (
 )
 
 // Service implements the write logic using Redpanda for WAL (Write-Ahead Log)
-// and Etcd for Metadata storage. This separation ensures high throughput for
-// write intents while maintaining strong consistency for metadata.
+// and Etcd for Metadata storage.
 type Service struct {
 	etcd  interfaces.IEtcdClient
-	mq    *mq.Client // Redpanda Client for high-throughput WAL
+	mq    *mq.Client
 	http  interfaces.IHttpClient
 	read  interfaces.IReadService
 	ec    interfaces.IEcDriver
 	utils interfaces.IUtilsSvc
 }
 
-// NewService creates a new WriteService with necessary dependencies.
+// NewService creates a new WriteService.
 func NewService(
 	etcd interfaces.IEtcdClient,
 	mqClient *mq.Client,
@@ -50,17 +49,13 @@ func NewService(
 	}
 }
 
-// computeSHA256Hex generates a SHA256 hash string for data fingerprinting.
 func computeSHA256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-// --- Write-Ahead Log Helpers (Redpanda Version) ---
+// --- Write-Ahead Log Helpers ---
 
-// createWALEntry writes the "PENDING" transaction record to Redpanda (Kafka).
-// Writing to Redpanda is significantly faster than Etcd due to sequential I/O,
-// allowing for higher write throughput.
 func (s *Service) createWALEntry(
 	ctx context.Context,
 	key string,
@@ -84,8 +79,6 @@ func (s *Service) createWALEntry(
 		return "", fmt.Errorf("failed to serialize WAL entry: %v", err)
 	}
 
-	// Write to Redpanda synchronously to ensure durability.
-	// The object 'key' is used as the Kafka Partition Key to preserve ordering if needed.
 	if err := s.mq.ProduceSync(ctx, key, valBytes); err != nil {
 		return "", fmt.Errorf("failed to write WAL to Redpanda: %v", err)
 	}
@@ -93,10 +86,6 @@ func (s *Service) createWALEntry(
 	return txnID, nil
 }
 
-// finalizeWALEntry commits the metadata to Etcd.
-// Unlike traditional database WALs, we do not delete the log from Redpanda immediately
-// after commit. Instead, we update the source of truth (Etcd Metadata) to mark the
-// data as valid and visible.
 func (s *Service) finalizeWALEntry(
 	ctx context.Context,
 	txnID string,
@@ -106,9 +95,6 @@ func (s *Service) finalizeWALEntry(
 ) error {
 
 	if !success {
-		// If the operation failed, we simply do nothing here.
-		// The Healer service is responsible for detecting stalled PENDING logs
-		// in Redpanda and reconciling the state eventually.
 		return nil
 	}
 
@@ -118,9 +104,6 @@ func (s *Service) finalizeWALEntry(
 		return fmt.Errorf("failed to serialize final metadata: %v", err)
 	}
 
-	// Commit to Etcd.
-	// This is the point of "Strong Consistency". Once this succeeds,
-	// the data is globally visible to readers.
 	_, err = s.etcd.Put(ctx, metaKey, string(metaBytes))
 	if err != nil {
 		return fmt.Errorf("failed to commit metadata to Etcd: %v", err)
@@ -131,7 +114,6 @@ func (s *Service) finalizeWALEntry(
 
 // --- Strategy A: Replication ---
 
-// WriteReplication writes a full copy of the data to all replica nodes.
 func (s *Service) WriteReplication(
 	ctx context.Context,
 	replicaNodes []string,
@@ -143,17 +125,16 @@ func (s *Service) WriteReplication(
 		"strategy": config.StrategyReplication,
 	}
 
-	// Step 1: Write Intent to WAL (Redpanda)
 	txnID, err := s.createWALEntry(ctx, key, config.StrategyReplication, walMeta)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 2: Write Payload to Storage Nodes
-	// Since storage nodes implement async write-back I/O, this operation is non-blocking.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	success := 0
+	// 用來記錄哪些節點寫入成功，方便 Healer 除錯或 API 回傳
+	writtenNodes := []string{}
 
 	for _, url := range replicaNodes {
 		wg.Add(1)
@@ -169,15 +150,19 @@ func (s *Service) WriteReplication(
 			if err == nil && resp.StatusCode == http.StatusOK {
 				mu.Lock()
 				success++
+				writtenNodes = append(writtenNodes, n)
 				mu.Unlock()
+			} else {
+				log.Printf("[WriteReplication] Failed to write to %s: %v", n, err)
 			}
 		}(url)
 	}
 	wg.Wait()
 
-	// Quorum check
-	if success < len(replicaNodes) {
-		return nil, fmt.Errorf("replication failed: success %d / required %d", success, len(replicaNodes))
+	// [CHANGE] Best Effort: 只要有 1 個寫入成功，我們就 Commit。
+	// 剩下的交給 Healer 去修復。
+	if success == 0 {
+		return nil, fmt.Errorf("replication failed entirely: 0/%d nodes responded", len(replicaNodes))
 	}
 
 	finalMeta := map[string]interface{}{
@@ -187,19 +172,26 @@ func (s *Service) WriteReplication(
 		"cold_hash":    "",
 	}
 
-	// Step 3: Commit Metadata to Etcd
+	// [ADDED] Explicitly mark as dirty if partial failure occurred
+	isDirty := success < len(replicaNodes)
+	if isDirty {
+		finalMeta["is_dirty"] = true
+		log.Printf("[PartialWrite] Key=%s marked dirty. %d/%d replicas written.", key, success, len(replicaNodes))
+	}
+
 	if err := s.finalizeWALEntry(ctx, txnID, true, key, finalMeta); err != nil {
 		return nil, err
 	}
 
 	return map[string]interface{}{
-		"nodes_written": replicaNodes,
+		"nodes_written": writtenNodes,
+		"status":        "committed",
+		"partial":       isDirty,
 	}, nil
 }
 
 // --- Strategy B: Erasure Coding (EC) ---
 
-// WriteEC splits data into shards, encodes them, and distributes them to EC nodes.
 func (s *Service) WriteEC(
 	ctx context.Context,
 	ecNodes []string,
@@ -218,13 +210,11 @@ func (s *Service) WriteEC(
 		"key_name":        key,
 	}
 
-	// 1. Write Intent to WAL
 	txnID, err := s.createWALEntry(ctx, key, config.StrategyEC, walMeta)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Split & Encode (CPU Intensive)
 	chunks, err := s.ec.Split(value)
 	if err != nil {
 		return nil, fmt.Errorf("EC split failed: %v", err)
@@ -233,7 +223,6 @@ func (s *Service) WriteEC(
 		return nil, fmt.Errorf("EC encode failed: %v", err)
 	}
 
-	// 3. Write Shards to Storage Nodes
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	success := 0
@@ -263,8 +252,10 @@ func (s *Service) WriteEC(
 	}
 	wg.Wait()
 
-	if success < totalChunks {
-		return nil, fmt.Errorf("EC write failed: success %d / required %d", success, totalChunks)
+	// [CHANGE] EC Constraint: 必須至少寫入 K 份，資料才是可讀的。
+	// 如果少於 K，就算 Commit 了也是壞檔，所以這裡必須報錯。
+	if success < config.K {
+		return nil, fmt.Errorf("EC write critical failure: %d/%d (Need at least %d to recover)", success, totalChunks, config.K)
 	}
 
 	finalMeta := map[string]interface{}{}
@@ -275,7 +266,13 @@ func (s *Service) WriteEC(
 	finalMeta["cold_version"] = time.Now().UnixNano()
 	finalMeta["cold_hash"] = computeSHA256Hex(value)
 
-	// 4. Commit Metadata to Etcd
+	// [ADDED] Mark as dirty if any chunk failed
+	isDirty := success < totalChunks
+	if isDirty {
+		finalMeta["is_dirty"] = true
+		log.Printf("[PartialWrite] Key=%s marked dirty. %d/%d chunks written.", key, success, totalChunks)
+	}
+
 	if err := s.finalizeWALEntry(ctx, txnID, true, key, finalMeta); err != nil {
 		return nil, err
 	}
@@ -283,14 +280,12 @@ func (s *Service) WriteEC(
 	return map[string]interface{}{
 		"chunks_written": success,
 		"total_chunks":   totalChunks,
+		"partial":        isDirty,
 	}, nil
 }
 
 // --- Strategy C: Field-level Hybrid ---
 
-// WriteFieldHybrid intelligently separates JSON into Hot and Cold fields.
-// It computes the hash of the cold part to detect if it has changed.
-// If the cold data is unchanged ("Pure Hot Update"), it skips the expensive EC operations.
 func (s *Service) WriteFieldHybrid(
 	ctx context.Context,
 	replicaNodes, ecNodes []string,
@@ -305,11 +300,8 @@ func (s *Service) WriteFieldHybrid(
 	hotKey := fmt.Sprintf("%s_hot", key)
 	coldPrefix := fmt.Sprintf("%s_cold_chunk_", key)
 
-	// 1. Separate Fields
 	newHot, newCold := s.utils.SeparateHotColdFields(dataDict)
 
-	// 2. Fetch Old Metadata from Etcd (Read Operation)
-	// We need this to compare the cold data hash.
 	metaKey := fmt.Sprintf("metadata/%s", key)
 	resp, _ := s.etcd.Get(ctx, metaKey)
 
@@ -331,19 +323,14 @@ func (s *Service) WriteFieldHybrid(
 		}
 	}
 
-	// 3. Compute New Cold Hash
 	newColdBytes, _ := s.utils.Serialize(newCold)
 	newColdHash := computeSHA256Hex(newColdBytes)
 
-	// 4. Determine Optimization Path
-	// If hashes match, we skip EC encoding and writing, saving significant I/O.
 	isPureHot := (newColdHash == oldColdHash)
 	if hotOnly {
-		log.Printf("[HYBRID] TraceID=%s Forced HotOnly mode.\n", traceID)
 		isPureHot = true
 	}
 
-	// 5. Write Intent to WAL
 	walMeta := map[string]interface{}{
 		"strategy":        config.StrategyFieldHybrid,
 		"hot_key":         hotKey,
@@ -360,7 +347,7 @@ func (s *Service) WriteFieldHybrid(
 		return nil, err
 	}
 
-	// 6. Write Hot Fields (Replication) - This is always executed as hot data is assumed to change.
+	// 1. Write Hot Fields (Replication)
 	hotBytes, _ := s.utils.Serialize(newHot)
 	var wg sync.WaitGroup
 	var hotMu sync.Mutex
@@ -385,19 +372,16 @@ func (s *Service) WriteFieldHybrid(
 		}(url)
 	}
 
-	// 7. Write Cold Fields (EC) - Executed ONLY if cold data actually changed.
+	// 2. Write Cold Fields (EC)
 	var coldMu sync.Mutex
 	coldSuccess := 0
 	totalCold := 0
 
 	if !isPureHot {
-		log.Printf("[HYBRID] TraceID=%s Cold data changed. Performing EC Split/Encode.\n", traceID)
-		
 		chunks, err := s.ec.Split(newColdBytes)
 		if err != nil {
 			return nil, fmt.Errorf("EC split failed: %v", err)
 		}
-
 		if err := s.ec.Encode(chunks); err != nil {
 			return nil, fmt.Errorf("EC encode failed: %v", err)
 		}
@@ -427,28 +411,41 @@ func (s *Service) WriteFieldHybrid(
 
 	wg.Wait()
 
-	// Validate Success Rates
-	if hotSuccess < len(replicaNodes) {
-		return nil, fmt.Errorf("Hybrid hot write failed: success %d / required %d", hotSuccess, len(replicaNodes))
+	// [CHANGE] Hybrid Validation
+	// Hot: 至少 1 份
+	if hotSuccess == 0 {
+		return nil, fmt.Errorf("Hybrid hot write failed entirely")
 	}
-	if !isPureHot && coldSuccess < totalCold {
-		return nil, fmt.Errorf("Hybrid cold chunks write failed: success %d / required %d", coldSuccess, totalCold)
+	// Cold: 如果有變動，至少 K 份
+	if !isPureHot && coldSuccess < config.K {
+		return nil, fmt.Errorf("Hybrid cold write critical failure: %d/%d", coldSuccess, totalCold)
 	}
 
-	// 8. Commit Metadata to Etcd
 	finalMeta := map[string]interface{}{}
 	for k, v := range walMeta {
 		finalMeta[k] = v
 	}
 
 	finalMeta["hot_version"] = time.Now().UnixNano()
-	// Maintain old cold version/hash if pure hot update
 	if isPureHot {
 		finalMeta["cold_version"] = oldColdVersion
 		finalMeta["cold_hash"] = oldColdHash
 	} else {
 		finalMeta["cold_version"] = time.Now().UnixNano()
 		finalMeta["cold_hash"] = newColdHash
+	}
+
+	// [ADDED] Calculate dirty status for Hybrid
+	isDirty := false
+	if hotSuccess < len(replicaNodes) {
+		isDirty = true
+	}
+	if !isPureHot && coldSuccess < totalCold {
+		isDirty = true
+	}
+	if isDirty {
+		finalMeta["is_dirty"] = true
+		log.Printf("[PartialWrite] Hybrid Key=%s marked dirty. Hot: %d/%d, Cold: %d/%d", key, hotSuccess, len(replicaNodes), coldSuccess, totalCold)
 	}
 
 	if err := s.finalizeWALEntry(ctx, txnID, true, key, finalMeta); err != nil {
@@ -459,7 +456,6 @@ func (s *Service) WriteFieldHybrid(
 	if isPureHot {
 		opType = "Pure Hot Update"
 	}
-	log.Printf("[HYBRID] TraceID=%s Completed. Type=%s\n", traceID, opType)
 
 	return map[string]interface{}{
 		"trace_id":            traceID,
@@ -467,5 +463,6 @@ func (s *Service) WriteFieldHybrid(
 		"hot_nodes_written":   hotSuccess,
 		"cold_chunks_written": coldSuccess,
 		"operation_type":      opType,
+		"partial":             isDirty,
 	}, nil
 }
