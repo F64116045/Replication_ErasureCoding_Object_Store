@@ -40,6 +40,7 @@ type storageEngine struct {
 
 // newStorageEngine initializes the storage directory and the async engine.
 func newStorageEngine(port, nodeName, storageDir string) *storageEngine {
+	// Ensure the storage directory exists
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
 		log.Fatalf("Failed to create storage directory %s: %v", storageDir, err)
 	}
@@ -124,6 +125,8 @@ func (s *storageEngine) retrieve(key string) ([]byte, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// [DEBUG] 印出路徑資訊，這行是為了解決 404 問題的關鍵
+			log.Printf("[Storage Debug] 404 Not Found. Key: '%s' | Resolved Path: '%s' | BaseDir: '%s'", key, filePath, s.storageDir)
 			return nil, nil
 		}
 		log.Printf("Error reading file %s: %v", filePath, err)
@@ -230,6 +233,8 @@ func registerAndHeartbeat(ctx context.Context, etcdClient *clientv3.Client, node
 			continue
 		}
 
+		// [FIX] 使用 Label Loop 來修復無限重試導致的 CPU 飆高與日誌洗版
+	KeepAliveLoop:
 		for {
 			select {
 			case <-ctx.Done():
@@ -240,7 +245,8 @@ func registerAndHeartbeat(ctx context.Context, etcdClient *clientv3.Client, node
 			case ka, ok := <-keepAliveChan:
 				if !ok {
 					log.Printf("[%s] Warning: KeepAlive channel closed. Re-registering...", nodeName)
-					break // Break inner loop to re-register
+					time.Sleep(1 * time.Second) // 避免瞬斷時瘋狂重試
+					break KeepAliveLoop         // 跳出內層迴圈，觸發外層迴圈重新註冊
 				}
 				_ = ka
 			}
@@ -276,14 +282,11 @@ func main() {
 
 	// 5. Start Gin Server
 	gin.SetMode(gin.ReleaseMode)
-	
-	// [CRITICAL CHANGE] Use gin.New() instead of gin.Default()
-	// gin.Default() uses Logger() middleware which prints to stdout for every request.
-	// This synchronous I/O kills performance in high throughput benchmarks.
+
+	// Use gin.New() + Logger + Recovery for Debugging
 	router := gin.New()
-	
-	// Only add Recovery middleware to prevent crashes
-	router.Use(gin.Recovery()) 
+	router.Use(gin.Recovery())
+	router.Use(gin.Logger()) // [ADDED] 開啟 Access Log
 
 	// 6. Bind Routes
 	router.GET("/health", func(c *gin.Context) {
@@ -330,7 +333,8 @@ func main() {
 		})
 	})
 
-	router.GET("/retrieve/:key", func(c *gin.Context) {
+	// [FIX] 提取 Handler 並同時支援 GET 和 HEAD 方法
+	retrieveHandler := func(c *gin.Context) {
 		key := c.Param("key")
 		data, err := storage.retrieve(key)
 		if err != nil {
@@ -341,8 +345,17 @@ func main() {
 			c.JSON(http.StatusNotFound, gin.H{"detail": "Key not found"})
 			return
 		}
+		// 如果是 HEAD 請求，不需要回傳 Body，只要狀態碼即可
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
 		c.Data(http.StatusOK, "application/octet-stream", data)
-	})
+	}
+
+	// 註冊兩個 Method
+	router.GET("/retrieve/:key", retrieveHandler)
+	router.HEAD("/retrieve/:key", retrieveHandler)
 
 	router.DELETE("/delete/:key", func(c *gin.Context) {
 		key := c.Param("key")
