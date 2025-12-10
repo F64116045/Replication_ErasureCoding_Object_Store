@@ -165,6 +165,10 @@ func (h *HealerService) processWalEntry(key, value []byte) error {
 		// Metadata missing: Transaction failed or API crashed before commit.
 		// In a rigorous system, we might perform "Rollback" (Delete garbage).
 		// For now, we skip.
+		log.Printf("[Healer] ALERT: Data Inconsistency Detected!")
+        log.Printf("   Txn: (from log)") 
+        log.Printf("   Key: %s", mainKey)
+        log.Printf("   Status: Missing in Etcd (Write Lost)")
 		return nil
 	}
 
@@ -335,11 +339,19 @@ func (h *HealerService) auditAndRepairEC(chunkPrefix, mainKey string) {
 
 func (h *HealerService) checkFileExists(nodeURL, key string) bool {
 	// Use HTTP HEAD to check existence efficiently
-	resp, err := h.httpClient.Head(fmt.Sprintf("%s/retrieve/%s", nodeURL, key))
+	url := fmt.Sprintf("%s/retrieve/%s", nodeURL, key)
+	resp, err := h.httpClient.Head(url)
 	if err != nil {
+		log.Printf("\033[31m[Debug] Network Error accessing %s: %v\033[0m", url, err)
 		return false
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+    if resp.StatusCode != http.StatusOK {
+        log.Printf("\033[31m[Debug] Node %s returned Error Status: %d\033[0m", url, resp.StatusCode)
+        return false
+    }
 	return resp.StatusCode == http.StatusOK
 }
 
