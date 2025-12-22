@@ -37,7 +37,7 @@ graph TD
         API -->|Metadata Commit | Etcd[Etcd Cluster x3]
     end
 
-    subgraph Data_Plane [Data Plane - Shared Nothing]
+    subgraph Data_Plane [Data Plane]
         direction TB
         
         API -->|Sharding/Replica| SN1
@@ -60,7 +60,7 @@ graph TD
     subgraph Reliability [Reliability]
         Healer[Healer Service] -.->|Consume WAL| RP
         Healer -.->|Poll Metadata| Etcd
-        Healer -.->|Repair - Copy or Reconstruct| SN1
+        Healer -.->|Repair| SN1
         Healer -.->|Repair| SN2
         Healer -.->|Repair| SN_N
     end
