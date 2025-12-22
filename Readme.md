@@ -7,6 +7,8 @@ This system addresses the write amplification problem inherent in traditional ob
 
 ## **Features**
 
+## **Features**
+
 - **Multi-Strategy Storage**
     - **Replication**: Ensures high availability for critical data.
     - **Erasure Coding (RS 4+2)**: Maximizes storage efficiency for larger data blobs.
@@ -16,17 +18,13 @@ This system addresses the write amplification problem inherent in traditional ob
 
 - **Self-Healing System**
     - **Leader Election**: Background `Healer` nodes compete for leadership to prevent race conditions.
-    - **Auto-Repair**: Automatically reconstructs missing EC shards or copies missing replicas.
-    - **Zombie Cleanup**: Rolls back stalled pending transactions automatically.
+    - **Active Polling (Maintenance)**: Periodically scans metadata to repair bit rot or insufficient replicas (Partial Writes).
+    - **Crash Recovery (WAL Consumer)**: Listens to the write-ahead log to detect and "resurrect" orphaned transactions caused by API Gateway failures.
 
 - **Log-Centric Architecture**
-    - **Redpanda as WAL**: Decouples the Write-Ahead Log from metadata storage. It utilizes sequential disk I/O to provide high-throughput durability guarantees.
-    - **Etcd for Metadata**: Ensures strong consistency for object location maps, hashes, and configuration, acting as the single source of truth for system state.
-    - **Stateless API Gateway**: The API layer is purely computational, allowing for horizontal scaling without complex state coordination.
-
-- **Async I/O Storage Engine**
-    - **Non-blocking Write-Back**: Storage nodes utilize an in-memory `WriteQueue` and background I/O workers to handle disk operations.
-    - **Latency Optimization**: Disk write latency is decoupled from the API response time, reducing storage node response latency from milliseconds to microseconds.
+    - **Redpanda as WAL**: Decouples the Write-Ahead Log from metadata storage. Provides crash recovery guarantees.
+    - **Etcd for Metadata**: Acts as the single source of truth.
+    - **Best-Effort Availability**: The system accepts partial writes (e.g., 1/3 replicas) to ensure high availability, marking them as `dirty` for background repair (Eventual Consistency).
 
 
 ## Architecture
@@ -49,7 +47,8 @@ graph TD
     end
 
     subgraph Reliability
-        Healer[Healer Service] -.->|Consume Log| RP
+        Healer[Healer Service] -.->|Consume WAL| RP
+        Healer[Healer Service] -.->|Poll Metadata| Etcd
         Healer -.->|Repair Data| SN
     end
 ```
@@ -62,7 +61,7 @@ graph TD
 | **Redpanda** | 1x | **Distributed WAL**. Stores write intents (PENDING state) with high throughput using Kafka protocol. |
 | **Etcd Cluster** | 3x | **Metadata Store**. Stores object locations and commit states. |
 | **Storage Node** | 6x | **Data Warehouse**. Stores actual data blobs using non-blocking buffered writes (Async I/O). |
-| **Healer** | 2x | **Recovery**. Reconciles inconsistencies between WAL and Data plane. |
+| **Healer** | 2x | **Recovery**. Dual-Track Recovery. Combines Polling (for maintenance) and WAL Consuming (for crash recovery) to ensure zero data loss. |
 
 ## Getting Started
 
