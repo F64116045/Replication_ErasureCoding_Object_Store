@@ -1,6 +1,6 @@
 # Replication + Erasure Coding Object Store
 
-Fault-tolerant distributed object storage system written in Go. It features a novel **Field-Level Hybrid Storage** strategy within a **Log-Centric Architecture**, optimizing costs by automatically splitting object (JSON data) into "Hot" (Replicated) and "Cold" (Erasure Coded) partitions based on access patterns.
+Fault-tolerant distributed object storage system written in Go. It features a novel **Field-Level Hybrid Storage** strategy, optimizing costs by automatically splitting object (JSON data) into "Hot" (Replicated) and "Cold" (Erasure Coded) partitions based on access patterns.
 
 This system addresses the write amplification problem inherent in traditional object storage systems when handling large, structured data with frequent metadata updates.
 
@@ -18,8 +18,6 @@ This system addresses the write amplification problem inherent in traditional ob
     - **Leader Election**: Background `Healer` nodes compete for leadership to prevent race conditions.
     - **Active Polling (Maintenance)**: Periodically scans metadata to repair bit rot or insufficient replicas (Partial Writes).
     - **Crash Recovery (WAL Consumer)**: Listens to the write-ahead log to detect and "resurrect" orphaned transactions caused by API Gateway failures.
-
-- **Log-Centric Architecture**
     - **Redpanda as WAL**: Decouples the Write-Ahead Log from metadata storage. Provides crash recovery guarantees.
     - **Etcd for Metadata**: Acts as the single source of truth.
     - **Best-Effort Availability**: The system accepts partial writes (e.g., 1/3 replicas) to ensure high availability, marking them as `dirty` for background repair (Eventual Consistency).
@@ -34,20 +32,37 @@ graph TD
     User[Client] -->|HTTP :8000| LB[Nginx Load Balancer]
     LB --> API[API Gateway Cluster x3]
 
-    subgraph Control Plane
+    subgraph Control_Plane [Control Plane]
         API -->|WAL Append | RP[Redpanda]
         API -->|Metadata Commit | Etcd[Etcd Cluster x3]
     end
 
-    subgraph Data Plane
-        API -->|Async Write| SN[Storage Nodes x6]
-        SN -->|Background Flush| Disk[(Local Disk)]
+    subgraph Data_Plane [Data Plane - Shared Nothing]
+        direction TB
+        
+        API -->|Sharding/Replica| SN1
+        API -->|Sharding/Replica| SN2
+        API -->|...| SN_N
+
+        subgraph Node_1 [Storage Node 1]
+            SN1[Service] --> D1[Local Disk]
+        end
+
+        subgraph Node_2 [Storage Node 2]
+            SN2[Service] --> D2[Local Disk]
+        end
+
+        subgraph Node_N [Storage Node ... 6]
+            SN_N[Service] --> D_N[Local Disk]
+        end
     end
 
-    subgraph Reliability
+    subgraph Reliability [Reliability]
         Healer[Healer Service] -.->|Consume WAL| RP
-        Healer[Healer Service] -.->|Poll Metadata| Etcd
-        Healer -.->|Repair Data| SN
+        Healer -.->|Poll Metadata| Etcd
+        Healer -.->|Repair - Copy or Reconstruct| SN1
+        Healer -.->|Repair| SN2
+        Healer -.->|Repair| SN_N
     end
 ```
 
