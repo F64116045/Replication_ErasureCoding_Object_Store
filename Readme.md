@@ -7,8 +7,6 @@ This system addresses the write amplification problem inherent in traditional ob
 
 ## **Features**
 
-## **Features**
-
 - **Multi-Strategy Storage**
     - **Replication**: Ensures high availability for critical data.
     - **Erasure Coding (RS 4+2)**: Maximizes storage efficiency for larger data blobs.
