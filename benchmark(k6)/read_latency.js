@@ -5,19 +5,19 @@ import { SharedArray } from 'k6/data';
 
 
 const BASE_URL = 'http://localhost:8000';
-
-// Dynamic configuration via environment variables
 const STRATEGY = __ENV.STRATEGY || 'field_hybrid'; 
 const SIZE_LABEL = __ENV.SIZE || '800kb';
 const KEYS_COUNT = 30; 
 
-// Generate data length based on the SIZE_LABEL
-let COLD_DATA_STRING = 'x'.repeat(SIZE_LABEL === '10kb' ? 10240 : (SIZE_LABEL === '100kb' ? 102400 : 819200));
+// Configure data size for the benchmark
+const COLD_DATA_STRING = 'x'.repeat(
+    SIZE_LABEL === '10kb' ? 10240 : (SIZE_LABEL === '100kb' ? 102400 : 819200)
+);
 
 const PRE_GENERATED_KEYS = new SharedArray('keys', function () {
     let arr = [];
     for (let i = 0; i < KEYS_COUNT; i++) {
-        // Tag keys with strategy for easier tracking in logs/etcd
+        // Tag keys with strategy for easier tracking in metadata/logs
         arr.push(`read-bench-${STRATEGY}-${SIZE_LABEL}-${i}-${uuidv4()}`);
     }
     return arr;
@@ -34,15 +34,15 @@ export const options = {
             duration: '30s',
         }
     },
-    // Threshold: 95% of read requests (including EC reconstruction) should complete under 1.5s
+    // Threshold: 95% of requests should complete under 1.5s
     thresholds: { 'http_req_duration': ['p(95)<1500'] },
 };
 
 /**
- * Setup phase: Pre-populates the cluster with data using the specified strategy.
+ * Setup: Pre-populates the cluster with data using the target strategy.
  */
 export function setup() {
-    console.log(`[Setup] Preparing ${KEYS_COUNT} objects using STRATEGY: ${STRATEGY} (${SIZE_LABEL})...`);
+    console.log(`[Setup] Preparing ${KEYS_COUNT} objects using ${STRATEGY} (${SIZE_LABEL})...`);
     
     let success = 0;
     for (let i = 0; i < KEYS_COUNT; i++) {
@@ -51,7 +51,6 @@ export function setup() {
             description: COLD_DATA_STRING 
         });
         
-        // Strategy parameter is injected dynamically
         let res = http.post(
             `${BASE_URL}/write?key=${PRE_GENERATED_KEYS[i]}&strategy=${STRATEGY}`, 
             payload, 
@@ -59,7 +58,8 @@ export function setup() {
         );
         
         if (res.status === 200) success++;
-        sleep(0.2); // Avoid overloading nodes during the setup phase
+        // Throttling to prevent saturating WSL2 I/O during setup
+        sleep(0.2); 
     }
     console.log(`[Setup] Done. ${success}/${KEYS_COUNT} objects ready for reading.`);
 }
