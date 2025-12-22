@@ -191,6 +191,41 @@ python3 test/hybrid_only.py
 ![Success1](./img/Success1.png)
 ![Success1](./img/Success2.png)
 
+
+### Storage Efficiency 
+
+The system significantly reduces storage overhead for large objects. We use test/verify_storage_docker.py to measure the Storage Amplification Factor across 6 storage nodes using a realistic IoT scenario.
+
+### Payload (IoT Telemetry)
+
+The test writes JSON objects with the following structure to simulate "Hot" metadata and "Cold" bulk logs:
+
+```
+{
+  "device_id": "sensor-gh-0001",    // Hot (Replicated)
+  "battery_level": 85,              // Hot (Replicated)
+  "status_code": 200,               // Hot (Replicated)
+  "is_active": true,                // Hot (Replicated)
+  "last_sync_ts": 1734842400,       // Hot (Replicated)
+  "firmware_version": "v2.4.1",     // Hot (Replicated)
+  "sensor_raw_log": "xxxx..."       // Cold (Erasure Coded, 800KB)
+}
+```
+
+**Run the verification:**
+
+```
+python3 test/verify_storage.py
+```
+
+**Measured Results (IoT Telemetry Scenario):**
+| Strategy | Overhead | 
+| --- | --- |
+| **Replication** | **3.0000x** | 
+| **Erasure Coding** | **1.5000x** | 
+| **Field Hybrid** | **~1.5000x** |
+![Storage](./img/Storage.png)
+
 ## Project Structure
 
 ```
