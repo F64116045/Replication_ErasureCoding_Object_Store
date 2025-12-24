@@ -335,7 +335,15 @@ func main() {
 			
 			dataDict, errDes := utilsSvc.Deserialize(dataBytes)
 			if errDes != nil {
-				c.Data(http.StatusOK, "application/octet-stream", dataBytes)
+				log.Printf("[Error] Key: %s, Parse failed: %v", key, errDes)
+    
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"status": "error",
+					"code":   500,
+					"message": "Data check failed",
+					"detail": "The data retrieved is corrupted. Please retry.",
+				})
+			    return
 			} else {
 				c.JSON(http.StatusOK, dataDict)
 			}
