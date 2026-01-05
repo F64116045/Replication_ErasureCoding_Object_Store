@@ -30,7 +30,7 @@ import (
 	// Register workload
 
 	"github.com/spf13/cobra"
-
+	_ "github.com/pingcap/go-ycsb/db/hybridstore"
 	"github.com/pingcap/go-ycsb/pkg/client"
 	"github.com/pingcap/go-ycsb/pkg/measurement"
 	"github.com/pingcap/go-ycsb/pkg/prop"
