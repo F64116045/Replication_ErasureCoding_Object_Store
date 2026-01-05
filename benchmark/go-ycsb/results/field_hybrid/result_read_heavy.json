@@ -1,0 +1,2 @@
+READ_ERROR - Takes(s): 0.6, Count: 47503, OPS: 77451.9, Avg(us): 581, Min(us): 21, Max(us): 16311, 50th(us): 274, 90th(us): 1485, 95th(us): 2045, 99th(us): 3889, 99.9th(us): 8263, 99.99th(us): 15143
+UPDATE_ERROR - Takes(s): 0.6, Count: 2497, OPS: 4087.3, Avg(us): 601, Min(us): 31, Max(us): 15263, 50th(us): 283, 90th(us): 1549, 95th(us): 2057, 99th(us): 3721, 99.9th(us): 8975, 99.99th(us): 15263

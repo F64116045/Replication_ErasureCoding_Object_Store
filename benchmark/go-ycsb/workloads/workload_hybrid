@@ -1,0 +1,17 @@
+recordcount=10000
+
+
+operationcount=50000
+
+workload=core
+
+
+fieldcount=10
+fieldlength=100
+
+
+requestdistribution=zipfian
+
+
+measurementtype=histogram
+histogram.buckets=2000
