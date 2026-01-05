@@ -1,0 +1,6 @@
+s3.bucket = ycsb
+s3.region = us-east-1
+s3.endpoint = http://localhost:4566
+s3.access_key = test
+s3.secret_key = test
+s3.use_path_style = true
