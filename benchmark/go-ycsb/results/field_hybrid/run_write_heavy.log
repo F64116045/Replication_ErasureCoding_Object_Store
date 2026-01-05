@@ -1,0 +1,22 @@
+Using request distribution 'zipfian' a keyrange of [0 10000]
+***************** properties *****************
+"fieldlength"="100"
+"recordcount"="10000"
+"histogram.buckets"="2000"
+"hybridstore.endpoint"="http://localhost:8000"
+"updateproportion"="0.5"
+"command"="run"
+"threadcount"="50"
+"workload"="core"
+"table"="usertable"
+"operationcount"="50000"
+"hybridstore.strategy"="field_hybrid"
+"requestdistribution"="zipfian"
+"measurement.output_file"="results/field_hybrid/result_write_heavy.json"
+"fieldcount"="10"
+"readproportion"="0.5"
+"measurementtype"="histogram"
+"dotransactions"="true"
+**********************************************
+**********************************************
+Run finished, takes 499.665589ms

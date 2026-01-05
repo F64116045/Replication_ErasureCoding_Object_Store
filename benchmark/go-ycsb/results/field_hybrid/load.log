@@ -1,0 +1,21 @@
+Using request distribution 'zipfian' a keyrange of [0 10000]
+***************** properties *****************
+"recordcount"="10000"
+"dotransactions"="false"
+"requestdistribution"="zipfian"
+"measurementtype"="histogram"
+"operationcount"="50000"
+"workload"="core"
+"hybridstore.strategy"="field_hybrid"
+"threadcount"="50"
+"histogram.buckets"="2000"
+"hybridstore.endpoint"="http://localhost:8000"
+"command"="load"
+"table"="usertable"
+"fieldcount"="10"
+"fieldlength"="100"
+**********************************************
+INSERT_ERROR - Takes(s): 9.9, Count: 9701, OPS: 981.6, Avg(us): 50091, Min(us): 4944, Max(us): 590335, 50th(us): 35135, 90th(us): 96255, 95th(us): 139775, 99th(us): 272127, 99.9th(us): 437247, 99.99th(us): 586239
+**********************************************
+Run finished, takes 10.426209505s
+INSERT_ERROR - Takes(s): 10.3, Count: 10000, OPS: 971.7, Avg(us): 49406, Min(us): 4944, Max(us): 590335, 50th(us): 34527, 90th(us): 95551, 95th(us): 139391, 99th(us): 268543, 99.9th(us): 437247, 99.99th(us): 586239
