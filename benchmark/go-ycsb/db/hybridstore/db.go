@@ -50,10 +50,14 @@ func (db *hybridDB) Insert(ctx context.Context, table string, key string, values
 		data[k] = string(v)
 	}
 
+	data["like_count"] = 0
 	data["view_count"] = 0
-	data["update_count"] = 0
 
-	data["sensor_raw_log"] = string(make([]byte, 800*1024))
+	rawLog := make([]byte, 100 * 1024)
+	for i := range rawLog {
+		rawLog[i] = 'A'
+	}
+	data["sensor_raw_log"] = string(rawLog)
 
 	return db.sendRequest(ctx, key, data)
 }
