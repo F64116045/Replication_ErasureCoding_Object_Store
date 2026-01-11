@@ -1,0 +1,22 @@
+Using request distribution 'uniform' a keyrange of [0 99]
+***************** properties *****************
+"hybridstore.endpoint"="http://localhost:8000"
+"command"="load"
+"readproportion"="0.5"
+"hybridstore.strategy"="replication"
+"recordcount"="100"
+"insertproportion"="0"
+"threadcount"="30"
+"table"="usertable"
+"readallfields"="true"
+"scanproportion"="0"
+"requestdistribution"="uniform"
+"dotransactions"="false"
+"workload"="core"
+"operationcount"="1000"
+"updateproportion"="0.5"
+**********************************************
+**********************************************
+Run finished, takes 3.018976445s
+INSERT - Takes(s): 2.2, Count: 100, OPS: 45.1, Avg(us): 778170, Min(us): 191360, Max(us): 1210367, 50th(us): 755199, 90th(us): 1093631, 95th(us): 1101823, 99th(us): 1157119, 99.9th(us): 1210367, 99.99th(us): 1210367
+TOTAL  - Takes(s): 2.2, Count: 100, OPS: 45.1, Avg(us): 778170, Min(us): 191360, Max(us): 1210367, 50th(us): 755199, 90th(us): 1093631, 95th(us): 1101823, 99th(us): 1157119, 99.9th(us): 1210367, 99.99th(us): 1210367
