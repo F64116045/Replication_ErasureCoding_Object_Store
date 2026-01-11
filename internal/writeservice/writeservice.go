@@ -295,7 +295,6 @@ func (s *Service) WriteFieldHybrid(
 ) (map[string]interface{}, error) {
 
 	traceID := uuid.New().String()
-	log.Printf("[HYBRID] Start TraceID=%s Key=%s HotOnly=%v\n", traceID, key, hotOnly)
 
 	hotKey := fmt.Sprintf("%s_hot", key)
 	coldPrefix := fmt.Sprintf("%s_cold_chunk_", key)
@@ -330,6 +329,8 @@ func (s *Service) WriteFieldHybrid(
 	if hotOnly {
 		isPureHot = true
 	}
+
+	log.Printf("[HYBRID] Start TraceID=%s Key=%s PureHot=%v\n", traceID, key, isPureHot)
 
 	walMeta := map[string]interface{}{
 		"strategy":        config.StrategyFieldHybrid,
