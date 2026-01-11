@@ -50,10 +50,10 @@ func (db *hybridDB) Insert(ctx context.Context, table string, key string, values
 		data[k] = string(v)
 	}
 
-	data["like_count"] = 0
-	data["view_count"] = 0
+	data["battery_level"] = 0
+	data["status_code"] = 0
 
-	rawLog := make([]byte, 100 * 1024)
+	rawLog := make([]byte, 1500 * 1024)
 	for i := range rawLog {
 		rawLog[i] = 'A'
 	}
@@ -65,8 +65,22 @@ func (db *hybridDB) Insert(ctx context.Context, table string, key string, values
 func (db *hybridDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
 	data := make(map[string]interface{})
 
-	data["view_count"] = time.Now().Unix()
+	data["battery_level"] = time.Now().Unix()
+	data["status_code"] = time.Now().Unix()
+	
+    mutationRate := 0.2 
+    
+    rawLog := make([]byte, 1500 * 1024)
+    for i := range rawLog {
+        rawLog[i] = 'A'
+    }
 
+    if rand.Float64() < mutationRate {
+        now := time.Now().UnixNano()
+        binary.LittleEndian.PutUint64(rawLog[0:8], uint64(now))
+    }
+
+	data["sensor_raw_log"] = string(rawLog)
 	return db.sendRequest(ctx, key, data)
 }
 

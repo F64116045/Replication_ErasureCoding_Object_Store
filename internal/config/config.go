@@ -38,6 +38,8 @@ var HotFields = map[string]bool{
 	"view_count":      true,
 	"inventory_count": true,
 	"update_count":    true,
+	"status_code": 	   true,
+	"battery_level":   true,
 }
 
 // Etcd related constants for keys and prefixes
